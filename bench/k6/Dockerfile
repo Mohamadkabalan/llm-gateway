@@ -10,5 +10,5 @@ RUN xk6 build v2.0.0 \
       --with github.com/phymbert/xk6-sse@v0.2.0 \
       --output /tmp/k6
 
-FROM grafana/k6:2.0.0
+FROM grafana/k6:2.4.0
 COPY --from=build /tmp/k6 /usr/bin/k6
