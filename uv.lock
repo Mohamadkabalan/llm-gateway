@@ -1246,9 +1246,9 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.11" },
     { name = "pydantic-settings", specifier = ">=2.8" },
     { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "redis", extras = ["hiredis"], specifier = ">=6.0" },
+    { name = "redis", extras = ["hiredis"], specifier = ">=8.1.0" },
     { name = "structlog", specifier = ">=25.1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0" },
 ]
 
 [package.metadata.requires-dev]
