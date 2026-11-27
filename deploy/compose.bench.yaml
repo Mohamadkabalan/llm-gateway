@@ -1,0 +1,65 @@
+# Benchmark stack (PLAN.md §16.1), driven by `make bench` / bench/run.py.
+#
+# A separate compose project, so it never shares containers or ports with `make up`.
+# Nothing is published to the host: k6 runs inside the network, and bench/run.py
+# reads gateway metrics with `docker compose exec`.
+#
+# CPU pinning: each component gets its own physical core(s). On the reference laptop
+# the SMT sibling pairs are (0,1) (2,3) (4,5) (6,7); check yours with `lscpu -e` and
+# override with SB_BENCH_CPUS_* if they differ. Under WSL2, the VM's vCPUs are still
+# scheduled by the host, so pinning reduces noise but does not eliminate it.
+
+name: switchboard-bench
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: switchboard/gateway:dev
+    environment:
+      SWITCHBOARD_ROUTING_CONFIG: /app/config/routing.bench.yaml
+      SWITCHBOARD_DEV_API_KEY: sb-bench-local-only
+      SWITCHBOARD_LOG_LEVEL: info
+      SWITCHBOARD_LOG_FORMAT: json
+    volumes:
+      - ../config:/app/config:ro
+    cpuset: "${SB_BENCH_CPUS_GATEWAY:-0,1}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    depends_on:
+      fake-provider: { condition: service_healthy }
+
+  fake-provider:
+    image: switchboard/gateway:dev
+    pull_policy: never
+    entrypoint: ["fakeprovider"]
+    command:
+      - --port=8000
+      - --workers=${SB_BENCH_FAKE_WORKERS:-2}
+      - --profile=/app/config/fake/bench.yaml
+    volumes:
+      - ../config:/app/config:ro
+    cpuset: "${SB_BENCH_CPUS_FAKE:-2,3}"
+    read_only: true
+    cap_drop: [ALL]
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  k6:
+    build: ../bench/k6
+    image: switchboard/k6:2.0.0-sse0.2.0
+    profiles: [tools]   # started per run by bench/run.py, never by `up`
+    volumes:
+      - ../bench/k6:/scripts:ro
+    cpuset: "${SB_BENCH_CPUS_K6:-4-7}"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }

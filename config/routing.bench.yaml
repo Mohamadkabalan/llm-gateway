@@ -1,0 +1,17 @@
+# Routing config for `make bench`: one fake provider, sized for 500+ concurrent streams.
+version: 1
+
+providers:
+  fake:
+    type: openai
+    base_url: http://fake-provider:8000/v1
+    # One connection per in-flight stream; idle ones are kept for reuse (keepalive_expiry).
+    pool: { max_connections: 2000 }
+
+models:
+  fake/fake-chat:
+    upstream_model: fake-chat
+
+aliases:
+  fake:
+    targets: [{ model: fake/fake-chat }]

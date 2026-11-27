@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT","object":"chat.completion.chunk","created":1741569952,"model":"gpt-5.4-mini-2026-03-05","system_fingerprint":"fp_1","choices":[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT","object":"chat.completion.chunk","created":1741569952,"model":"gpt-5.4-mini-2026-03-05","system_fingerprint":"fp_1","choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT","object":"chat.completion.chunk","created":1741569952,"model":"gpt-5.4-mini-2026-03-05","system_fingerprint":"fp_1","choices":[{"index":0,"delta":{"content":" there"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT","object":"chat.completion.chunk","created":1741569952,"model":"gpt-5.4-mini-2026-03-05","system_fingerprint":"fp_1","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT","object":"chat.completion.chunk","created":1741569952,"model":"gpt-5.4-mini-2026-03-05","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":30,"total_tokens":1230,"prompt_tokens_details":{"cached_tokens":1024,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":12,"audio_tokens":0}}}
+
+data: [DONE]
+

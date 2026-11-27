@@ -1,0 +1,7 @@
+{
+  "source": "docs",
+  "docs": [
+    "OpenAI API reference: Chat Completions, streaming chunk object (developers.openai.com)"
+  ],
+  "note": "Built from the documented chunk shapes on 2026-11-27; replace with a recording (scripts/record_fixtures.py)."
+}

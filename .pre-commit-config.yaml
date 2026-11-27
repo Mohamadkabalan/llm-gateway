@@ -7,10 +7,14 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-json
+      # Recorded SSE fixtures are byte-exact: an event stream must end with a blank line.
       - id: end-of-file-fixer
+        exclude: ^tests/fixtures/.*\.sse$
       - id: trailing-whitespace
+        exclude: ^tests/fixtures/.*\.sse$
       - id: mixed-line-ending
         args: [--fix=lf]
+        exclude: ^tests/fixtures/.*\.sse$
       - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=1024]

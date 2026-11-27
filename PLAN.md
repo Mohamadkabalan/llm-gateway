@@ -1,6 +1,6 @@
 # Switchboard: implementation plan
 
-**Status:** approved 2026-11-27. **Progress:** Phase 0 complete, awaiting review. You chose Python, a Next.js admin UI and the repo name `llm-gateway`, and left the other open questions to me; §20 records how I resolved them. Nothing below has been measured yet. Every number in this file is a provider fact (with a source), a config default, or an explicit *target*. None is a result.
+**Status:** approved 2026-11-27. **Progress:** Phases 0–2 complete. The Phase 1 decision gate (§0.1) is still open: it needs a benchmark run on a quiet machine. Phase notes are in §20. You chose Python, a Next.js admin UI and the repo name `llm-gateway`, and left the other open questions to me; §20 records how I resolved them. Measured results live in `bench/results/` and the ADRs, each with the command that produced it. Every other number in this file is a provider fact (with a source), a config default, or an explicit *target*.
 
 Switchboard is a self-hostable LLM gateway. Apps call one OpenAI-compatible endpoint with a virtual key. The gateway:
 
@@ -109,7 +109,7 @@ flowchart LR
 | `api/` | FastAPI routers, OpenAI error envelope, SSE writer, size limits, request IDs | everything below via the pipeline |
 | `schemas/` | OpenAI-compatible request/response models (the IR), normalized stream events | nothing |
 | `routing/` | Config models, loader and validation, hot reload, rule engine, A/B selection, capability filter → `RoutePlan` | `schemas` |
-| `providers/` | `ProviderAdapter` protocol, OpenAI / Anthropic / Ollama adapters, HTTP client pools, error classification | `schemas` |
+| `providers/` | `ProviderAdapter` protocol, OpenAI / Anthropic / Ollama adapters, the upstream HTTP transport (`http.py`, aiohttp, ADR-0012), SSE decoding, error classification, the thinking sidecar (`thinking.py`, ADR-0009) | `schemas`, `routing` (config and target types only), a Redis client for the sidecar |
 | `reliability/` | Executor (timeouts, retries, fallback, hedging), circuit breaker, backoff, retry budget | `providers`, `storage` |
 | `cache/` | Key normalization, exact cache (Redis), semantic cache (pgvector), stream replay | `storage`, `providers` (embeddings) |
 | `auth/` | Key format, hashing, lookup, in-process key cache, invalidation listener | `storage` |
@@ -219,7 +219,7 @@ The steps in detail:
 | Connect/DNS/TLS error | yes | yes | yes |
 | Timeout before commit (connect, first token, idle) | yes (once) | yes | yes |
 | 429 rate limited (`retry-after` ≤ cap) | yes | yes | yes |
-| 429 quota/spend exhausted (OpenAI `insufficient_quota` and related codes; Anthropic `error.details.error_code: enforced_spend_limit_reached`) | no | yes | yes |
+| Quota/spend exhausted (OpenAI 429 `insufficient_quota` and related codes; Anthropic 429 `details.error_code` `enforced_spend_limit_reached` / `contract_spend_limit_reached`, 402 `billing_error`, and the 400 "You have reached your specified API usage limits") | no | yes | yes |
 | 500/502/503/504, Anthropic 529 `overloaded_error`, SSE `error` event before commit | yes | yes | yes |
 | 401/403 from provider (our credentials are bad) | no | yes | yes, plus an error log |
 | 400 context length exceeded | no | only to candidates with larger `max_input_tokens` | no |
@@ -266,12 +266,13 @@ class ProviderAdapter(Protocol):
 @dataclass(frozen=True)
 class CallContext:
     request_id: str
-    deadline: float  # monotonic; the executor derives per-attempt timeouts from it
     timeouts: Timeouts  # connect, first_token, idle, total
     attempt: int
-    span: Span
-    sidecar: ThinkingSidecar  # §3.4 (no-op for non-Anthropic adapters)
+    timings: CallTimings  # perf_counter stamps the adapter records for overhead metrics
+    # Added with the features that need them: span (Phase 6), sidecar (§3.4, Phase 2).
 ```
+
+As implemented in Phase 1 (`src/switchboard/providers/base.py`), `stream_chat` returns an `AsyncGenerator`, so the caller can close it deterministically (`contextlib.aclosing`) on disconnect or timeout. `embed` arrives with `/v1/embeddings` in Phase 2. Classification lives next to each adapter (`classify_response`) and in the transport for network errors.
 
 Non-streaming client requests use the same `stream_chat` and are aggregated by `schemas.aggregate()`, so there is only one upstream code path (ADR-0003). Adding a provider means writing one module and one fixtures directory, and registering it in the provider config.
 
@@ -289,13 +290,13 @@ StreamEvent = (
 )
 ```
 
-Usage is normalized into explicit buckets. Anthropic reports `input_tokens` separately from `cache_read_input_tokens` and `cache_creation_input_tokens` (to be confirmed with recorded fixtures). OpenAI's `prompt_tokens` *includes* `prompt_tokens_details.cached_tokens`. The encoder turns the buckets back into OpenAI `usage`, including `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`.
+Usage is normalized into explicit buckets. Anthropic reports `input_tokens` excluding `cache_read_input_tokens` and `cache_creation_input_tokens` (split into 5-minute and 1-hour writes), and reasoning in `output_tokens_details.thinking_tokens` (verified in the docs in Phase 2). OpenAI's `prompt_tokens` *includes* `prompt_tokens_details.cached_tokens`. The encoder turns the buckets back into OpenAI `usage`, including `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`.
 
 ### 3.3 OpenAI ↔ Anthropic translation (Phase 2 scope)
 
 | OpenAI Chat Completions | Anthropic Messages (API version `2026-10-21`) |
 |---|---|
-| Leading `system`/`developer` messages | Top-level `system`. Mid-conversation system messages stay in place if the current API accepts them (the thinking docs say not to move them, but I still have to verify the request shape). Otherwise they become a user-turn text block marked `[system]`. |
+| Leading `system`/`developer` messages | Top-level `system`. Later ones stay in place as `role: "system"` messages, which the API accepts right after a user turn and before an assistant turn or the end (verified in Phase 2). Moving them would invalidate earlier thinking. Anywhere else they become a user-turn text block marked `[system]`. |
 | `user`/`assistant` text and image parts (`image_url` as data URL or https) | `text` blocks; `image` blocks with base64 or `url` source. Consecutive same-role messages are merged. |
 | `assistant.tool_calls[].function.arguments` (JSON string) | `tool_use` block with `input` (object). Invalid JSON returns a 400 naming the call. |
 | `role: tool` messages | One `user` message with `tool_result` blocks, merging consecutive tool messages |
@@ -303,10 +304,10 @@ Usage is normalized into explicit buckets. Anthropic reports `input_tokens` sepa
 | `tool_choice`: `auto` / `none` | `{type: auto}` / `{type: none}` |
 | `tool_choice`: `required` / named function | `{type: any}` / `{type: tool, name}`. The capability filter removes Opus 5.5, Sonnet 5.5 and Fable 5.2, which return 400 for forced tool use. |
 | `max_completion_tokens` / `max_tokens` | `max_tokens`, which Anthropic requires. If absent, the per-model `defaults.max_tokens` applies. Thinking tokens count against it. |
-| `reasoning_effort` (`minimal`/`low`/`medium`/`high`/`xhigh`) | `output_config.effort` (`low`/`medium`/`high`/`xhigh`). Our own mapping: `none` and `minimal` become `low`. Anthropic's compatibility layer ignores this field. |
+| `reasoning_effort` (`minimal`/`low`/`medium`/`high`/`xhigh`) | `output_config.effort` (`low`/`medium`/`high`/`xhigh`/`max`). Our own mapping: `none` and `minimal` become `low`; `max` is reachable through `provider_options`. Anthropic's compatibility layer ignores this field. |
 | `temperature`, `top_p` | **Rejected with 400 by API version `2026-10-21` on every model.** Default is to drop them and list them in `x-switchboard-dropped-params`. Setting `unsupported_params: error` returns a 400 instead. A provider entry can pin `api_version: "2023-06-01"` for older models that still accept sampling parameters. |
 | `stop` | `stop_sequences` |
-| `response_format: json_schema` | Structured outputs via `output_config.format` (exact shape to be verified in Phase 2). `json_object` has no equivalent, so the capability filter handles it. |
+| `response_format: json_schema` | `output_config.format: {type: "json_schema", schema}` (verified in Phase 2). `json_object` has no equivalent, so the capability filter handles it. |
 | `n > 1`, `logprobs`, `logit_bias` | Unsupported; the capability filter removes the candidate, or the request gets a 400 if no candidate is left |
 | `seed`, `presence_penalty`, `frequency_penalty` | Dropped and reported in `x-switchboard-dropped-params` |
 | `user` | `metadata.user_id` |
@@ -349,6 +350,7 @@ What we do:
 
 - Uses Ollama's OpenAI-compatible `/v1/chat/completions`, `/v1/embeddings` and `/v1/models`, so it reuses the OpenAI adapter with a capability profile: no `tool_choice`, `n`, logprobs or image URLs.
 - The docs list `stream_options.include_usage` as supported. If a recorded fixture shows usage is missing in streams, the adapter switches to native `/api/chat` NDJSON. The final object there carries `prompt_eval_count`, `eval_count` and durations, and tool-call `arguments` are objects that must be serialized.
+- **Phase 2 decision:** the OpenAI-compatible `/v1` is used (`providers/ollama.py`). Its documented limits are applied: `max_tokens` instead of `max_completion_tokens`, no `tool_choice` (`none` is sent as "no tools"), no `user`, and images only as base64 data URLs.
 - Cost is 0 by default (configurable).
 
 ### 3.7 Embeddings and models
@@ -409,7 +411,7 @@ providers:
     api_key_env: ANTHROPIC_API_KEY        # secrets only ever come from env
     api_version: "2026-10-21"
     unsupported_params: drop               # drop | error
-    pool: { max_connections: 200, max_keepalive: 100 }
+    pool: { max_connections: 1000, keepalive_expiry: 30s }
   openai:
     type: openai
     base_url: https://api.openai.com/v1
@@ -722,13 +724,13 @@ CREATE TABLE audit_log (id bigserial PRIMARY KEY, at timestamptz NOT NULL DEFAUL
 
   | Group | Metrics |
   |---|---|
-  | Traffic and latency | `switchboard_requests_total{alias,provider,model,status,cache}`, `switchboard_request_duration_seconds`, `switchboard_ttft_seconds` |
+  | Traffic and latency | `switchboard_requests_total{alias,provider,model,status,outcome}` (a `cache` label joins in Phase 5), `switchboard_request_duration_seconds`, `switchboard_ttft_seconds` |
   | Gateway overhead | `switchboard_gateway_overhead_seconds{phase=pre_upstream\|first_chunk_forward}` |
   | Tokens and cost | `switchboard_tokens_total{type}`, `switchboard_cost_usd_total{team,provider,model}` |
   | Cache | `switchboard_cache_lookups_total`, `switchboard_cache_saved_usd_total` |
   | Reliability | `switchboard_attempts_total{outcome}`, `switchboard_fallbacks_total{from,to,reason}`, `switchboard_retries_total`, `switchboard_breaker_state{provider_model}`, `switchboard_hedges_total` |
   | Limits and budgets | `switchboard_ratelimit_rejections_total`, `switchboard_budget_utilization_ratio{team}` |
-  | Process internals | `switchboard_inflight_streams`, `switchboard_usage_queue_depth`, `switchboard_usage_events_dropped_total`, `switchboard_config_reloads_total`, plus the standard process metrics (RSS, CPU, open FDs) |
+  | Process internals | `switchboard_inflight_requests`, `switchboard_usage_queue_depth`, `switchboard_usage_events_dropped_total`, `switchboard_config_reloads_total`, plus the standard process metrics (RSS, CPU, open FDs) |
 
   Histograms carry exemplars with `trace_id`.
 - **Tracing.** OpenTelemetry SDK exporting OTLP to Tempo.
@@ -840,7 +842,7 @@ The pages:
 │   ├── compose.prod.yaml + Caddyfile + docs/DEPLOY.md
 │   ├── prometheus/ · tempo/ · grafana/{provisioning,dashboards}/
 ├── bench/
-│   ├── k6/                       chat_stream.js, chat_nonstream.js, baseline_direct.js
+│   ├── k6/                       Dockerfile (pinned k6 + xk6-sse), chat_stream.js (one script for the gateway and the direct baseline)
 │   ├── run.py                    orchestrates runs, captures environment, samples docker stats
 │   ├── report.py                 raw results → tables and charts in docs/
 │   ├── chaos/                    scenario runner + chart
@@ -887,7 +889,7 @@ Fixtures come from `scripts/record_fixtures.py` run against the real APIs with y
 
 ### 15.2 Fake provider (`src/fakeprovider`)
 
-- **Protocols.** Speaks OpenAI `/v1/chat/completions` and `/v1/embeddings`, Anthropic `/v1/messages` and Ollama `/api/chat`.
+- **Protocols.** Speaks OpenAI `/v1/chat/completions` and `/v1/embeddings` (Phase 1). The Anthropic `/v1/messages` and Ollama `/api/chat` dialects are added in Phase 2, next to their adapters, once their wire formats are re-checked against the docs.
 - **Configurable behaviour.**
   - TTFT distribution, inter-chunk delay, chunk count and size, and output token count
   - error injection: an HTTP status with a probability, 429 with `retry-after`, 529, a mid-stream `error` event, a mid-stream TCP reset, a hang that never sends a first byte, and slow drip
@@ -955,7 +957,7 @@ One stream and one tool round trip per real provider (Anthropic and OpenAI), plu
   - Gateway CPU %, RSS at idle and at peak (cgroup `memory.current` via docker stats, sampled each second, plus `process_resident_memory_bytes`).
 - **Capacity:** an open-model `ramping-arrival-rate` run finds the highest arrival rate one process sustains with p99 added TTFT ≤ 25 ms and errors < 0.1%. These are thresholds I set, not results.
 - **Reproducibility.**
-  - `make bench` runs the whole matrix (about 30 minutes) and writes `bench/results/<timestamp>-<gitsha>/`. That folder holds the raw k6 summaries and time series, docker stats, environment capture (CPU model, cores, RAM, kernel, Docker version, git SHA, config hash) and the exact commands.
+  - `make bench` runs the whole matrix (about 70 minutes: 3 levels × 3 repetitions × 2 paths × 3.5 min) and writes `bench/results/<timestamp>-<gitsha>/`. That folder holds the raw k6 summaries and time series, docker stats, environment capture (CPU model, cores, RAM, kernel, Docker version, git SHA, config hash) and the exact commands.
   - `bench/report.py` generates the tables in `docs/BENCHMARKS.md` from those files, so no number is typed by hand.
   - `make bench-quick` runs one repetition at a shorter duration, for development.
 - **Caveat.** The bench box is a laptop: i7-10510U (4 cores, 8 threads, 15 W, prone to thermal throttling), 16 GB RAM, WSL2 with Docker Desktop. BENCHMARKS.md will say so prominently. See §20.
@@ -1148,7 +1150,7 @@ At the end of every phase I run `make lint` and `make test`, fix what fails, wri
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Python per-chunk CPU cost saturates one process at 500 streams (about 25k chunks/s with the proposed fake settings) | Added latency grows sharply at high concurrency | orjson, no per-chunk Pydantic, uvloop; measured in Phase 1 with a decision gate; horizontal replicas; report honestly if one process saturates |
-| httpx connection-pool overhead at high concurrency (a known pain point) | Inflated overhead | Measured in Phase 1; the transport is isolated in `providers/http.py`, so it can be swapped for aiohttp if httpx is the measured bottleneck |
+| httpx connection-pool overhead at high concurrency (a known pain point) | Inflated overhead | **Happened, resolved in Phase 1.** httpcore's pool does O(connections²) work per request, and httpx used about 3.5× the CPU per streamed chunk of aiohttp in an A/B run; the transport is now aiohttp behind `providers/http.py` (ADR-0012) |
 | Bench box noise (laptop thermal throttling, WSL2 virtual networking, load generator on the same host) | Numbers that are not representative or not repeatable | CPU pinning, repetitions with spread reported, environment capture, a clear caveat; optional cloud-VM run (§20) |
 | Translation drift (thinking blocks, forced `tool_choice`, removed sampling parameters, prefill rejection, mid-stream refusals; new API versions) | Broken or quietly degraded behaviour | Capability matrix, explicit errors and dropped-parameter headers, recorded fixtures, `make test-live`, optional nightly canary |
 | Recorded fixtures need real API access | Tests built on documentation examples | Docs-derived fixtures marked as such until recording; recording costs cents |
@@ -1159,7 +1161,8 @@ At the end of every phase I run `make lint` and `make test`, fix what fails, wri
 | Hedging doubles cost | Surprise spend | Off by default, ratio-capped, waste recorded |
 | Usage rows lost on a hard crash | Ledger gaps | The window is bounded by the flush interval and documented; budgets unaffected; Redis Streams available as an alternative (ADR-0006) |
 | Prometheus label cardinality | TSDB blow-up | Labels go down to team only; per-key detail in Postgres |
-| `xk6-sse` maintenance and supply chain (forks exist; one surfaced next to a package-compromise report) | Bench tooling breaks or is untrustworthy | Pin the upstream `phymbert/xk6-sse` at a reviewed commit and build it in Docker; fall back to a small asyncio/httpx load generator with the same output format |
+| `xk6-sse` maintenance and supply chain (forks exist; one surfaced next to a package-compromise report) | Bench tooling breaks or is untrustworthy | Upstream `phymbert/xk6-sse` v0.2.0 (Go-checksummed), built in Docker with k6 pinned to v2.0.0, because k6 v2.4.0 broke the extension's JS API (ADR-0011). Fallback: a small asyncio load generator with the same output format |
+| A shared, busy bench machine (other projects' containers and jobs on the same laptop; WSL2 reports no CPU steal time) | CPU and latency numbers inflated by work that isn't ours, and not repeatable | Record load average and other running containers in every run's manifest; compare only interleaved runs; take decision-grade numbers only from a quiet machine (§20, Phase 1 notes) |
 | Scope creep (many features) | Unfinished core | Phase gates; semantic cache, hedging and the LLM judge are explicitly optional |
 
 ---
@@ -1177,3 +1180,77 @@ You decided 3, 4 and the repo name. You left the rest to me, so I applied best p
 3. **Language: Python** (your call), with the Phase 1 decision gate kept as a safeguard.
 4. **Admin UI: Next.js + TypeScript** (your call). Designed as a thin client over the Python admin API (§13, ADR-0008).
 5. **Repo:** local `git init` as `llm-gateway` (product name remains Switchboard), licensed Apache-2.0. I won't commit, create a GitHub remote, or push unless you ask.
+
+### Phase 1 notes (2026-11-27)
+
+Decisions and findings from building the thin slice. Measured numbers are quoted with the
+run that produced them; raw files are in `bench/results/`.
+
+- **Upstream transport: aiohttp, not httpx (ADR-0012).** Profiling the gateway under
+  streaming load showed httpcore's connection pool doing O(connections²) work per request,
+  plus a deep pure-Python read path (h11, anyio) on every chunk. An interleaved A/B of the
+  two clients is in ADR-0012. The transport sits behind `providers/http.py`, so adapters
+  never import an HTTP library. httpx remains a dev dependency for tests.
+- **k6 pinned to v2.0.0 (ADR-0011).** xk6-sse v0.2.0 does not work with k6 v2.4.0: the SSE
+  client reached scripts without its methods. k6 has no sub-millisecond clock, so client
+  timings are whole milliseconds; the gateway's histograms give the sub-millisecond view.
+- **Fake provider scope.** Phase 1 ships the OpenAI dialect (chat, embeddings, models),
+  every fault from §15.2, profiles, `x-fake-*` headers, a `fake` body field (so tests drive
+  it through the gateway) and the control API. The control API refuses to run with more
+  than one worker, because stats and runtime behavior are per process. The Anthropic and
+  Ollama dialects move to Phase 2 with their adapters.
+- **Commit point and disconnects (ADR-0003).** Implemented as planned. Two follow-ups for
+  Phase 3: keep-alive pings before a slow first token, and an idle timeout that is
+  independent of `first_token` (today the transport's read timeout is the longer of the two).
+- **Config.** `pool.max_keepalive` was dropped: aiohttp keeps idle connections until
+  `keepalive_expiry` rather than capping their number, and the config should not promise
+  what the transport does not do. The default `max_connections` is now 1000, since each
+  in-flight stream holds a connection.
+- **Metrics names.** `switchboard_requests_total` has `status` (the HTTP status sent, 499 for
+  a client that left before the status line) and `outcome` (`success`, `upstream_error`,
+  `client_disconnect`, `cancelled`). The in-flight gauge is `switchboard_inflight_requests`.
+- **Known gap.** `make dev` runs the gateway on the host, where the compose service name
+  `fake-provider` in `config/routing.yaml` does not resolve, so the `fake` alias only works
+  in the full stack (`make up`).
+- **Decision gate: not decided yet; the first run is invalid.** `make bench-quick` (run
+  `scratch-20261127T144122Z-4d2c807`, git-ignored) ran while the laptop's load average was
+  25–32 from unrelated work. By the methodology in §16.1 the run does not count: the direct
+  baseline, which bypasses the gateway, was not stable (its p50 TTFT was 337 ms at 50
+  streams, 952 ms at 200 and 2512 ms at 500, against a configured 300 ms). One signal is
+  still worth recording: the gateway completed about 10–12 streams per second at every
+  level while the direct path reached 69, so even on a crowded machine the gateway
+  saturates well before the fake provider does. The next step is a full `make bench` on a
+  quiet machine (other stacks stopped, or a dedicated VM), then the review in §0.1.
+
+### Phase 2 notes (2026-11-27)
+
+- **Anthropic facts re-checked in the docs.** Three things differ from what this plan first
+  assumed: mid-conversation `role: "system"` messages are supported (so they stay in place,
+  §3.3); hitting your own spend limit returns a 400, not a 429 (§2.2); and effort has a fifth
+  level, `max`. Everything is summarized in `docs/PROVIDERS.md`.
+- **What the Phase 2 code covers.** `providers/anthropic_request.py` is a pure translation
+  function with a determinism property test; `providers/anthropic.py` handles streaming, error
+  classification and the thinking sidecar (ADR-0009). `/v1/embeddings` and `/v1/models` are
+  served for every provider type, and capability gaps are 400s naming the gap
+  (`routing/capabilities.py`; Phase 3 turns them into candidate filtering).
+- **Request fields the adapter cannot send** are dropped and listed in
+  `x-switchboard-dropped-params`, or refused when the provider sets `unsupported_params: error`.
+  A new error kind, `invalid_request`, covers requests that cannot be expressed for a
+  provider; they never reach it.
+- **Thinking sidecar store.** Redis when configured; otherwise an in-process LRU, which is
+  correct for one replica. Metric: `switchboard_thinking_passback_total{result}`.
+- **Fake provider.** It now speaks the Anthropic Messages API (`/v1/messages`) as well. It
+  rejects what the real API rejects (sampling parameters under 2026-10-21, prefill, a missing
+  `max_tokens`), so translation mistakes fail tests. New scenarios: `auto` (a tool call when
+  tools are offered, text after a tool result), parallel tool calls, thinking plus a tool
+  call, refusal and `max_tokens`. The local stack has `fake-claude` (through the Anthropic
+  translation) and `fake-embed` aliases.
+- **Fixtures.** `tests/fixtures/` holds docs-derived fixtures (`"source": "docs"`); every one
+  is replayed through the real stream code whole and at random split points.
+  `make record-fixtures` records real ones (`recorded_*`), which are checked against the
+  expectations in their metadata.
+- **Contract tests.** The Python SDK (component and stack tests) and the TypeScript SDK
+  (`tests/sdk-ts`, `make test-sdk-ts`, run in CI against the compose stack) complete a tool
+  round trip through the fake Anthropic provider.
+- **Still to do with your keys:** `make record-fixtures` and `make test-live` (real
+  `claude-sonnet-5-5` and OpenAI through the gateway). Both make a handful of small calls.

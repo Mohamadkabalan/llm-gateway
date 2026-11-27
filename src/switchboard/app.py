@@ -12,13 +12,17 @@ from prometheus_client import start_http_server
 from starlette.types import ASGIApp
 
 from switchboard import __version__
-from switchboard.api import health
+from switchboard.api import chat, embeddings, health, models
 from switchboard.api.errors import install_error_handlers
 from switchboard.api.middleware import RequestContextMiddleware
 from switchboard.lifecycle import Lifecycle
 from switchboard.observability.logging import configure_logging
+from switchboard.observability.metrics import CONFIG_INFO
+from switchboard.providers.registry import build_adapters
+from switchboard.providers.thinking import MemoryThinkingSidecar, RedisThinkingSidecar
 from switchboard.readiness import NamedProbe, ReadinessChecker
 from switchboard.routing import ConfigError, LoadedConfig, load_routing_config
+from switchboard.routing.table import RoutingTable
 from switchboard.settings import Settings
 from switchboard.state import AppState
 from switchboard.storage.clients import create_pg_pool, create_redis, ping_postgres, ping_redis
@@ -47,6 +51,8 @@ def build_api(
         if pg_pool is not None:
             probes.append(NamedProbe("postgres", partial(ping_postgres, pg_pool)))
 
+        sidecar = RedisThinkingSidecar(redis) if redis is not None else MemoryThinkingSidecar()
+        adapters = build_adapters(routing, sidecar=sidecar)
         app.state.switchboard = AppState(
             settings=settings,
             routing=routing,
@@ -56,18 +62,24 @@ def build_api(
                 timeout=settings.ready_check_timeout_seconds,
                 cache_seconds=settings.ready_cache_seconds,
             ),
+            routing_table=RoutingTable(routing),
+            adapters=adapters,
             redis=redis,
             pg_pool=pg_pool,
         )
+        CONFIG_INFO.labels(version=routing.version).set(1)
         metrics_server = _start_metrics_server(settings)
 
         for warning in routing.warnings:
             _log.warning("config.warning", problem=str(warning))
+        if settings.dev_api_key is None:
+            _log.warning("auth.no_keys", detail="SWITCHBOARD_DEV_API_KEY is unset; /v1 rejects all")
         _log.info(
             "gateway.started",
             version=__version__,
             config_source=routing.source,
             config_version=routing.version,
+            providers=sorted(adapters),
             disabled_providers=sorted(routing.disabled_providers),
             port=settings.port,
             metrics_port=settings.metrics_port or None,
@@ -79,6 +91,7 @@ def build_api(
             # period for open ones; this catches work that outlived its connection.
             _log.info("gateway.stopping", inflight=lifecycle.inflight)
             drained = await _wait_idle(lifecycle, _DRAIN_TIMEOUT_AFTER_SERVER)
+            await asyncio.gather(*(adapter.aclose() for adapter in adapters.values()))
             if metrics_server is not None:
                 await asyncio.to_thread(metrics_server.shutdown)
                 metrics_server.server_close()
@@ -102,6 +115,9 @@ def build_api(
     )
     install_error_handlers(api)
     api.include_router(health.router)
+    api.include_router(chat.router)
+    api.include_router(embeddings.router)
+    api.include_router(models.router)
     return api
 
 

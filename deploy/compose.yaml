@@ -19,6 +19,7 @@ services:
       SWITCHBOARD_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       SWITCHBOARD_LOG_LEVEL: ${SWITCHBOARD_LOG_LEVEL:-info}
       SWITCHBOARD_LOG_FORMAT: ${SWITCHBOARD_LOG_FORMAT:-json}
+      SWITCHBOARD_DEV_API_KEY: ${SWITCHBOARD_DEV_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ports:
@@ -28,10 +29,29 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      fake-provider: { condition: service_healthy }
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
     stop_grace_period: 30s   # > SWITCHBOARD_SHUTDOWN_GRACE_SECONDS (25s) so streams can drain
+
+  # The fake provider ships in the gateway image. The `fake` alias routes to it, so the
+  # stack answers real OpenAI SDK calls with no provider keys.
+  fake-provider:
+    <<: *hardening
+    image: switchboard/gateway:dev
+    pull_policy: never   # built by the gateway service
+    entrypoint: ["fakeprovider"]
+    command: ["--port", "8000", "--profile", "/app/config/fake/default.yaml"]
+    volumes:
+      - ../config:/app/config:ro
+    read_only: true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   postgres:
     <<: *hardening

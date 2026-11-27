@@ -1,0 +1,8 @@
+# Fake provider behavior for the local stack (`make up`): visibly streams, no faults.
+# Per request, override any field with an `x-fake-<field>` header (dashes for
+# underscores) or a `fake` object in the request body. See src/fakeprovider/behavior.py.
+ttft_ms: 150
+interval_ms: 25
+chunks: 20
+# Call a tool when tools are offered; answer tool results with text.
+scenario: auto

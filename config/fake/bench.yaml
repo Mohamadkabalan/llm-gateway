@@ -1,0 +1,5 @@
+# Upstream behavior for `make bench` (PLAN.md §16.1). These are fake-provider settings,
+# not measurements: TTFT 300 ms, then 100 chunks 20 ms apart (about 2.3 s per stream).
+ttft_ms: 300
+interval_ms: 20
+chunks: 100

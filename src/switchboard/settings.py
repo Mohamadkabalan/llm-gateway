@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, RedisDsn
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,15 @@ class Settings(BaseSettings):
 
     log_level: LogLevel = "info"
     log_format: LogFormat = LogFormat.JSON
+
+    dev_api_key: SecretStr | None = Field(
+        default=None,
+        description="A single static API key for local use. Virtual keys replace it in "
+        "Phase 4. With no key configured, every /v1 request is rejected.",
+    )
+    max_request_bytes: int = Field(
+        default=8 * 1024 * 1024, ge=1024, description="Larger request bodies get a 413."
+    )
 
     redis_url: RedisDsn | None = None
     database_url: PostgresDsn | None = None

@@ -18,6 +18,11 @@ updates:
     schedule: { interval: weekly }
     cooldown: { default-days: 14 }
 
+  - package-ecosystem: docker   # bench/k6 builder and runtime images
+    directory: /bench/k6
+    schedule: { interval: weekly }
+    cooldown: { default-days: 14 }
+
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule: { interval: weekly }

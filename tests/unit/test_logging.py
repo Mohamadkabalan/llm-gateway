@@ -55,3 +55,17 @@ def test_secret_looking_fields_are_masked(stream: io.StringIO) -> None:
     assert line["api_key"] == "***"
     assert line["headers"] == {"Authorization": "***"}
     assert line["model"] == "m"
+
+
+def test_token_counts_are_not_mistaken_for_credentials(stream: io.StringIO) -> None:
+    structlog.get_logger().info(
+        "done", prompt_tokens=12, max_tokens=5, access_token="abc", token="def", session_cookie="c"
+    )
+    line = last_line(stream)
+    assert (line["prompt_tokens"], line["max_tokens"]) == (12, 5)
+    assert line["access_token"] == line["token"] == line["session_cookie"] == "***"
+
+
+def test_httpx_request_lines_are_suppressed(stream: io.StringIO) -> None:
+    logging.getLogger("httpx").info("HTTP Request: POST https://upstream")
+    assert "HTTP Request" not in stream.getvalue()

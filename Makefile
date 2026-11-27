@@ -24,13 +24,23 @@ help: ## Show this help
 	cp .env.example .env
 	@echo "Created .env from .env.example (add provider keys there if you have them)."
 
+.PHONY: dev-key
+dev-key: .env ## Make sure .env has a SWITCHBOARD_DEV_API_KEY (generates a random one)
+	@if ! grep -qE '^SWITCHBOARD_DEV_API_KEY=.+' .env; then \
+		key="sb-dev-$$(python3 -c 'import secrets; print(secrets.token_hex(16))')"; \
+		grep -v '^SWITCHBOARD_DEV_API_KEY=' .env > .env.tmp || true; \
+		echo "SWITCHBOARD_DEV_API_KEY=$$key" >> .env.tmp; \
+		mv .env.tmp .env; \
+		echo "Generated SWITCHBOARD_DEV_API_KEY in .env"; \
+	fi
+
 .PHONY: install
 install: ## Install dependencies and git hooks
 	uv sync --locked
 	uv run pre-commit install
 
 .PHONY: dev
-dev: .env ## Run the gateway on the host with auto-reload (Postgres/Redis from compose)
+dev: dev-key ## Run the gateway on the host with auto-reload (Postgres/Redis from compose)
 	$(COMPOSE) up -d --wait postgres redis
 	SWITCHBOARD_LOG_FORMAT=console \
 	SWITCHBOARD_REDIS_URL=redis://127.0.0.1:$(SB_REDIS_PORT)/0 \
@@ -59,25 +69,40 @@ lint: ## Lint, format check and strict type check (plus actionlint if Docker is 
 	else echo "docker not found: skipping actionlint"; fi
 
 .PHONY: test
-test: ## Run unit tests (integration tests join in Phase 1)
+test: ## Unit and component tests (no Docker needed)
 	uv run pytest -m "not integration and not live"
 
 .PHONY: test-unit
 test-unit: ## Run unit tests only
 	uv run pytest tests/unit
 
+.PHONY: test-integration
+test-integration: dev-key ## Tests against the running compose stack (run `make up` first)
+	SB_GATEWAY_URL=http://127.0.0.1:$(SB_GATEWAY_PORT) uv run --env-file .env pytest -m integration
+
 .PHONY: cov
-cov: ## Unit tests with a coverage report
-	uv run pytest tests/unit --cov --cov-report=term-missing
+cov: ## Unit and component tests with a coverage report
+	uv run pytest -m "not integration and not live" --cov --cov-report=term-missing
+
+.PHONY: test-sdk-ts
+test-sdk-ts: dev-key ## The OpenAI TypeScript SDK against the running stack (run `make up` first)
+	cd tests/sdk-ts && npm ci --no-audit --no-fund --ignore-scripts
+	OPENAI_BASE_URL=http://127.0.0.1:$(SB_GATEWAY_PORT)/v1 \
+	OPENAI_API_KEY="$$(grep '^SWITCHBOARD_DEV_API_KEY=' .env | cut -d= -f2-)" \
+	node tests/sdk-ts/tool_roundtrip.mjs
 
 .PHONY: test-live
-test-live: ## Contract tests against real providers (Phase 2)
-	@echo "test-live arrives in Phase 2 (needs provider keys)." && exit 1
+test-live: ## Real Claude and OpenAI through the gateway; keys from .env (well under 1 cent)
+	uv run --env-file .env pytest -m live tests/live
+
+.PHONY: record-fixtures
+record-fixtures: ## Record real provider streams as test fixtures; keys from .env (under 1 cent)
+	uv run --env-file .env python scripts/record_fixtures.py
 
 # --- stack -----------------------------------------------------------------------------
 
 .PHONY: up
-up: .env ## Build and start the full stack, waiting until every service is healthy
+up: dev-key ## Build and start the full stack, waiting until every service is healthy
 	$(COMPOSE) up -d --build --wait
 	@echo "Gateway:    http://127.0.0.1:$(SB_GATEWAY_PORT)/ready"
 	@echo "Grafana:    http://127.0.0.1:$${SB_GRAFANA_PORT:-7300}"
@@ -99,11 +124,19 @@ ps: ## Show stack status
 logs: ## Follow gateway logs
 	$(COMPOSE) logs -f gateway
 
-# --- measurement (implemented in later phases) -----------------------------------------
+# --- measurement -----------------------------------------------------------------------
 
 .PHONY: bench
-bench: ## Load test: gateway-added latency at 50/200/500 streams (Phase 1/8)
-	@echo "bench arrives in Phase 1 (harness) and Phase 8 (published run)." && exit 1
+bench: ## Gateway-added latency at 50/200/500 streams, 3 reps (~70 min; PLAN.md §16.1)
+	uv run python -m bench.run --levels 50,200,500 --reps 3 --warmup 30 --duration 180
+
+.PHONY: bench-quick
+bench-quick: ## Same matrix, 1 rep, short runs (~8 min); results are git-ignored
+	uv run python -m bench.run --levels 50,200,500 --reps 1 --warmup 10 --duration 30 --scratch
+
+.PHONY: bench-report
+bench-report: ## Rebuild a run's report: make bench-report RUN=bench/results/<run-id>
+	uv run python -m bench.report $(RUN)
 
 .PHONY: chaos
 chaos: ## Kill/degrade the primary provider under load (Phase 8)

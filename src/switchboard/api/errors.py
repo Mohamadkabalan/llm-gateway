@@ -12,6 +12,8 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from switchboard.routing.table import RouteError
+
 _TYPE_BY_STATUS = {
     400: "invalid_request_error",
     401: "authentication_error",
@@ -23,6 +25,28 @@ _TYPE_BY_STATUS = {
     422: "invalid_request_error",
     429: "rate_limit_exceeded",
 }
+
+
+class GatewayError(Exception):
+    """An error the gateway reports in the OpenAI shape, raised from request handlers."""
+
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        error_type: str | None = None,
+        param: str | None = None,
+        code: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.error_type = error_type
+        self.param = param
+        self.code = code
+        self.headers = headers
 
 
 class ORJSONResponse(Response):
@@ -53,6 +77,23 @@ def error_response(
     )
 
 
+async def _gateway_error(_request: Request, exc: GatewayError) -> Response:
+    return error_response(
+        exc.status,
+        exc.message,
+        error_type=exc.error_type,
+        param=exc.param,
+        code=exc.code,
+        headers=exc.headers,
+    )
+
+
+async def _route_error(_request: Request, exc: RouteError) -> Response:
+    return error_response(
+        exc.status, exc.message, error_type=exc.error_type, param="model", code=exc.code
+    )
+
+
 async def _http_exception(_request: Request, exc: StarletteHTTPException) -> Response:
     headers = dict(exc.headers) if exc.headers else None
     return error_response(exc.status_code, exc.detail, headers=headers)
@@ -75,6 +116,8 @@ async def _unhandled(request: Request, _exc: Exception) -> Response:
 
 
 def install_error_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(GatewayError, _gateway_error)  # type: ignore[arg-type]
+    app.add_exception_handler(RouteError, _route_error)  # type: ignore[arg-type]
     app.add_exception_handler(StarletteHTTPException, _http_exception)  # type: ignore[arg-type]
     app.add_exception_handler(RequestValidationError, _validation_error)  # type: ignore[arg-type]
     app.add_exception_handler(Exception, _unhandled)

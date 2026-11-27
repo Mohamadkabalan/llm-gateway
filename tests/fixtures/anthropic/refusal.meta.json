@@ -1,0 +1,9 @@
+{
+  "source": "docs",
+  "docs": [
+    "/docs/en/build-with-claude/streaming",
+    "/docs/en/api/messages/create"
+  ],
+  "api_version": "2026-10-21",
+  "note": "Built from the documented event shapes on 2026-11-27; replace with a recording (scripts/record_fixtures.py)."
+}

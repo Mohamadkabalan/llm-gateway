@@ -26,7 +26,7 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from switchboard.routing.config import AliasConfig, ModelKind, RoutingConfig
+from switchboard.routing.config import AliasConfig, ModelKind, RoutingConfig, merge_timeouts
 
 ConfigPath = tuple[str | int, ...]
 Severity = Literal["error", "warning"]
@@ -285,6 +285,7 @@ def _check_semantics(
     checker = _SemanticChecker(config, env, lines)
     checker.check_providers()
     checker.check_model_names()
+    checker.check_timeouts()
     for name, alias in config.aliases.items():
         checker.check_alias(name, alias)
     return checker.errors, checker.warnings, checker.disabled
@@ -331,6 +332,23 @@ class _SemanticChecker:
                     ("models", key),
                     f"unknown provider '{match['provider']}'" + _did_you_mean(hint),
                 )
+
+    def check_timeouts(self) -> None:
+        """Overrides are validated one level at a time by the schema; this checks the
+        merged result each model actually runs with."""
+        defaults = self.config.defaults.timeouts
+        for key, model in self.config.models.items():
+            provider = self.config.providers.get(key.partition("/")[0])
+            if provider is None:
+                continue  # reported by check_model_names
+            try:
+                merge_timeouts(defaults, provider.timeouts, model.timeouts)
+            except ValidationError as exc:
+                message = exc.errors()[0]["msg"].removeprefix("Value error, ")
+                path: ConfigPath = (
+                    ("models", key, "timeouts") if model.timeouts else ("models", key)
+                )
+                self.issue(path, f"effective timeouts are invalid: {message}")
 
     def check_alias(self, name: str, alias: AliasConfig) -> None:
         base: ConfigPath = ("aliases", name)

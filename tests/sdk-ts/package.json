@@ -1,0 +1,9 @@
+{
+  "name": "switchboard-sdk-ts-smoke",
+  "private": true,
+  "description": "The official OpenAI TypeScript SDK against a running Switchboard stack.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node tool_roundtrip.mjs" },
+  "dependencies": { "openai": "7.56.0" }
+}

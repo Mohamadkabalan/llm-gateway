@@ -16,7 +16,7 @@ from structlog.typing import EventDict, Processor, WrappedLogger
 
 from switchboard.settings import LogFormat, LogLevel
 
-_SECRET_MARKERS = ("authorization", "api_key", "apikey", "password", "secret", "token", "pepper")
+_SECRET_MARKERS = ("authorization", "api_key", "apikey", "password", "secret", "pepper", "cookie")
 _MASK = "***"
 
 
@@ -28,7 +28,9 @@ def redact_secrets(_logger: WrappedLogger, _method: str, event_dict: EventDict) 
 def _redact(mapping: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
     for key, value in mapping.items():
         lowered = key.lower()
-        if any(marker in lowered for marker in _SECRET_MARKERS):
+        # "token" alone, or as a suffix (access_token), is a credential; "prompt_tokens"
+        # and "max_tokens" are counts.
+        if lowered.endswith("token") or any(marker in lowered for marker in _SECRET_MARKERS):
             mapping[key] = _MASK
         elif isinstance(value, MutableMapping):
             mapping[key] = _redact(dict(value))
@@ -89,3 +91,6 @@ def configure_logging(
         uv_logger.propagate = True
     # The gateway writes its own access log with request ids (api.middleware).
     logging.getLogger("uvicorn.access").disabled = True
+    # httpx logs every upstream request at INFO; the access log already covers them.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(max(logging.WARNING, root.level))

@@ -64,6 +64,16 @@ class TimeoutOverrides(StrictModel):
     total: Duration | None = None
 
 
+def merge_timeouts(base: Timeouts, *overrides: TimeoutOverrides | None) -> Timeouts:
+    """Apply overrides in order (provider, then model). Raises ``ValidationError`` if
+    the merged result is inconsistent."""
+    values = base.model_dump()
+    for override in overrides:
+        if override is not None:
+            values.update(override.model_dump(exclude_none=True))
+    return Timeouts.model_validate(values)
+
+
 class RetryPolicy(StrictModel):
     max_attempts: int = Field(default=2, ge=1, le=10)
     base_delay: Duration = 0.25
@@ -107,8 +117,17 @@ class ProviderType(StrEnum):
 
 
 class PoolConfig(StrictModel):
-    max_connections: int = Field(default=200, ge=1)
-    max_keepalive: int = Field(default=100, ge=0)
+    """Upstream connection pool, per provider and per gateway replica.
+
+    Every upstream call streams over its own HTTP/1.1 connection, so
+    ``max_connections`` caps concurrent requests to this provider. Requests beyond it
+    wait for a free connection for up to ``timeouts.connect``.
+    """
+
+    max_connections: int = Field(default=1000, ge=1)
+    keepalive_expiry: Duration = Field(
+        default=30.0, description="Close idle connections after this long."
+    )
 
 
 class ProviderConfig(StrictModel):
@@ -126,6 +145,11 @@ class ProviderConfig(StrictModel):
     )
     timeouts: TimeoutOverrides | None = None
     pool: PoolConfig = PoolConfig()
+    thinking_passback: bool = Field(
+        default=True,
+        description="Anthropic only: carry thinking blocks across OpenAI-format tool loops "
+        "(PLAN.md §3.4).",
+    )
 
 
 class ModelKind(StrEnum):
@@ -134,10 +158,14 @@ class ModelKind(StrEnum):
 
 
 class Capabilities(StrictModel):
+    """What a model accepts. Requests needing more get a 400 naming the gap (Phase 3:
+    such candidates are skipped instead, so a fallback can serve the request)."""
+
     tools: bool = True
     vision: bool = False
     forced_tool_choice: bool = True
     json_schema: bool = False
+    json_object: bool = True
     max_input_tokens: int | None = Field(default=None, ge=1)
     max_output_tokens: int | None = Field(default=None, ge=1)
 

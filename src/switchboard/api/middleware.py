@@ -3,6 +3,13 @@
 Written as plain ASGI rather than Starlette's ``BaseHTTPMiddleware``, which buffers
 and adds per-request overhead to streaming responses. It wraps the whole FastAPI app,
 including Starlette's error middleware, so even a 500 carries ``x-request-id``.
+
+It puts two things in the ASGI scope state for handlers:
+
+* ``received_at``: ``time.perf_counter()`` when the request arrived, the start of
+  every gateway latency measurement.
+* ``log``: a dict that handlers fill with request fields (route, tokens, outcome).
+  They are written on the single ``http.request`` line, so each request logs once.
 """
 
 import re
@@ -37,12 +44,14 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send)
             return
 
+        start = time.perf_counter()
         request_id = incoming_request_id(scope) or str(uuid.uuid7())
-        scope.setdefault("state", {})["request_id"] = request_id
+        log_fields: dict[str, object] = {}
+        state = scope.setdefault("state", {})
+        state.update(request_id=request_id, received_at=start, log=log_fields)
         header = (REQUEST_ID_HEADER, request_id.encode("ascii"))
         status_code = 500
         response_started = False
-        start = time.perf_counter()
 
         async def send_with_request_id(message: Message) -> None:
             nonlocal status_code, response_started
@@ -64,10 +73,11 @@ class RequestContextMiddleware:
             finally:
                 path = scope["path"]
                 if path not in self._quiet_paths or status_code >= 500:
-                    _log.info(
-                        "http.request",
-                        method=scope["method"],
-                        path=path,
-                        status=status_code,
-                        duration_ms=round((time.perf_counter() - start) * 1000, 2),
-                    )
+                    fields: dict[str, object] = {
+                        "method": scope["method"],
+                        "path": path,
+                        "status": status_code,
+                        "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                    }
+                    fields.update(log_fields)  # handlers know more (e.g. 499 for a disconnect)
+                    _log.info("http.request", **fields)

@@ -5,7 +5,8 @@
 # unset, so `make up` works without any provider keys.
 #
 # Model IDs and capabilities were checked against provider docs on 2026-11-27
-# (PLAN.md §3.8). Prices live in config/pricing/ (Phase 4).
+# (PLAN.md §3.8; Anthropic re-checked for Phase 2, see docs/PROVIDERS.md). Prices live
+# in config/pricing/ (Phase 4).
 
 version: 1
 
@@ -33,25 +34,30 @@ providers:
     base_url: http://ollama:11434
     timeouts: { first_token: 120s }   # CPU inference is slow to start
   fake:
-    # Configurable fake provider (Phase 1) used by tests, benchmarks and chaos runs.
+    # Configurable fake provider used by tests, benchmarks and chaos runs. It speaks
+    # both the OpenAI API (this entry) and the Anthropic API (fake-anthropic).
     type: openai
     base_url: http://fake-provider:8000/v1
+  fake-anthropic:
+    type: anthropic
+    base_url: http://fake-provider:8000
+    api_version: "2026-10-21"
 
 models:
   anthropic/claude-opus-5-5:
     upstream_model: claude-opus-5-5
     capabilities: { tools: true, vision: true, forced_tool_choice: false, json_schema: true,
-                    max_input_tokens: 1000000, max_output_tokens: 128000 }
+                    json_object: false, max_input_tokens: 1000000, max_output_tokens: 128000 }
     defaults: { max_tokens: 8192 }
   anthropic/claude-sonnet-5-5:
     upstream_model: claude-sonnet-5-5
     capabilities: { tools: true, vision: true, forced_tool_choice: false, json_schema: true,
-                    max_input_tokens: 1000000, max_output_tokens: 128000 }
+                    json_object: false, max_input_tokens: 1000000, max_output_tokens: 128000 }
     defaults: { max_tokens: 8192 }
   anthropic/claude-haiku-5-5:
     upstream_model: claude-haiku-5-5
     capabilities: { tools: true, vision: true, forced_tool_choice: true, json_schema: true,
-                    max_input_tokens: 1000000, max_output_tokens: 128000 }
+                    json_object: false, max_input_tokens: 1000000, max_output_tokens: 128000 }
     defaults: { max_tokens: 4096 }
   openai/gpt-5.4-mini:
     upstream_model: gpt-5.4-mini
@@ -65,6 +71,15 @@ models:
   fake/fake-chat:
     upstream_model: fake-chat
     capabilities: { tools: true, vision: true, json_schema: true }
+  fake/fake-embed:
+    upstream_model: fake-embed
+    kind: embedding
+  fake-anthropic/fake-claude:
+    # Translated like a real Claude model; the fake checks requests the way the API does.
+    upstream_model: fake-claude
+    capabilities: { tools: true, vision: true, forced_tool_choice: true, json_schema: true,
+                    json_object: false, max_output_tokens: 128000 }
+    defaults: { max_tokens: 1024 }
 
 aliases:
   smart:
@@ -78,7 +93,12 @@ aliases:
   local:
     targets: [{ model: ollama/llama3.2 }]
   fake:
-    description: Fake provider; works with no API keys.
+    description: Fake provider (OpenAI format); works with no API keys.
     targets: [{ model: fake/fake-chat }]
+  fake-claude:
+    description: Fake provider through the Anthropic translation; no keys needed.
+    targets: [{ model: fake-anthropic/fake-claude }]
+  fake-embed:
+    targets: [{ model: fake/fake-embed }]
   embed-default:
     targets: [{ model: openai/text-embedding-3-small }]
