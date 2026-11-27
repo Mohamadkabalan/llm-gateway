@@ -1,11 +1,11 @@
 """What a request needs from a model, checked against the model's declared capabilities.
 
-Phase 2 rejects a request whose target lacks something it needs, with a 400 that names
-the gap. Phase 3 uses the same check to skip such candidates, so a fallback model that
-can serve the request does.
+The router skips candidates that lack something a request needs, so a fallback that can
+serve it does; when no candidate is left, the client gets a 400 naming the gap.
 """
 
 import math
+from collections.abc import Callable
 
 import orjson
 
@@ -23,7 +23,13 @@ def estimate_prompt_tokens(chat: ChatRequest) -> int:
     return math.ceil(size / BYTES_PER_TOKEN)
 
 
-def missing_capabilities(chat: ChatRequest, capabilities: Capabilities) -> list[str]:
+def missing_capabilities(
+    chat: ChatRequest,
+    capabilities: Capabilities,
+    prompt_tokens: Callable[[], int] | None = None,
+) -> list[str]:
+    """The gaps, each phrased to follow "does not support". ``prompt_tokens`` supplies a
+    cached size estimate; it is only called for models with ``max_input_tokens``."""
     missing: list[str] = []
     if chat.tools and not capabilities.tools:
         missing.append("tools")
@@ -40,7 +46,7 @@ def missing_capabilities(chat: ChatRequest, capabilities: Capabilities) -> list[
     if limit and capabilities.max_output_tokens and limit > capabilities.max_output_tokens:
         missing.append(f"more than {capabilities.max_output_tokens} output tokens")
     if capabilities.max_input_tokens:
-        estimate = estimate_prompt_tokens(chat)
+        estimate = prompt_tokens() if prompt_tokens else estimate_prompt_tokens(chat)
         if estimate > capabilities.max_input_tokens:
             missing.append(
                 f"a prompt of about {estimate} tokens (limit {capabilities.max_input_tokens})"

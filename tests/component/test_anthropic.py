@@ -258,7 +258,8 @@ async def test_prefill_is_rejected_before_the_upstream_call(claude: Stack) -> No
     ("upstream", "status", "code"),
     [
         ({"status": 529}, 502, "upstream_error"),
-        ({"status": 429, "retry_after": 3}, 429, "upstream_rate_limited"),
+        # Past honor_retry_after_up_to, so it is returned instead of retried.
+        ({"status": 429, "retry_after": 30}, 429, "upstream_rate_limited"),
         (
             {"status": 429, "error_code": "enforced_spend_limit_reached"},
             503,

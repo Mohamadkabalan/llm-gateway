@@ -1,4 +1,5 @@
-"""``GET /v1/models`` and ``GET /v1/models/{id}``: the aliases and models a key can use."""
+"""``GET /v1/models`` and ``GET /v1/models/{id}``: the aliases and models a key can use
+(its own and its team's ``allowed_models``, when set)."""
 
 from typing import Any
 
@@ -14,17 +15,21 @@ router = APIRouter()
 @router.get("/v1/models")
 async def list_models(request: Request) -> ORJSONResponse:
     state = get_state(request)
-    authenticate(request, state.settings.dev_api_key)
-    data = [_model(name, owner) for name, owner, _kind in state.routing_table.listing()]
+    key = await authenticate(request, state.keys)
+    data = [
+        _model(name, owner)
+        for name, owner, _kind in state.config.current.table.listing()
+        if key.may_use(name)
+    ]
     return ORJSONResponse({"object": "list", "data": data})
 
 
 @router.get("/v1/models/{model_id:path}")
 async def retrieve_model(model_id: str, request: Request) -> ORJSONResponse:
     state = get_state(request)
-    authenticate(request, state.settings.dev_api_key)
-    for name, owner, _kind in state.routing_table.listing():
-        if name == model_id:
+    key = await authenticate(request, state.keys)
+    for name, owner, _kind in state.config.current.table.listing():
+        if name == model_id and key.may_use(name):
             return ORJSONResponse(_model(name, owner))
     raise GatewayError(
         404,

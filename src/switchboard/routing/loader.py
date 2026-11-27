@@ -6,8 +6,9 @@ Validation runs in three passes, and all problems found are reported together:
    silently overwrite).
 2. Schema validation with Pydantic: types, ranges and unknown fields, with "did you
    mean" hints.
-3. Semantic checks: every alias target and fallback exists, each model's provider
-   exists, required environment variables are set.
+3. Semantic checks: every alias target, fallback and rule reference exists, each
+   model's provider exists, merged policies are consistent, rules are reachable, and
+   required environment variables are set.
 
 The result is an immutable ``LoadedConfig`` whose ``version`` is a short hash of the
 file, exposed in ``/ready`` and logs so you can tell which config a process runs.
@@ -26,7 +27,15 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from switchboard.routing.config import AliasConfig, ModelKind, RoutingConfig, merge_timeouts
+from switchboard.accounting.pricing import PriceTable, PricingError, load_pricing
+from switchboard.routing.config import (
+    ModelKind,
+    RouteSpec,
+    RoutingConfig,
+    Rule,
+    merge_policy,
+    merge_timeouts,
+)
 
 ConfigPath = tuple[str | int, ...]
 Severity = Literal["error", "warning"]
@@ -82,9 +91,11 @@ class ConfigError(Exception):
 class LoadedConfig:
     config: RoutingConfig
     source: str
-    version: str
+    version: str  # covers the routing file and its pricing file
     warnings: tuple[ConfigIssue, ...] = ()
     disabled_providers: frozenset[str] = frozenset()
+    pricing: PriceTable | None = None
+    pricing_path: Path | None = None
 
 
 def load_routing_config(path: Path, *, env: Mapping[str, str] | None = None) -> LoadedConfig:
@@ -94,12 +105,17 @@ def load_routing_config(path: Path, *, env: Mapping[str, str] | None = None) -> 
         raise ConfigError(str(path), [ConfigIssue((), "file not found")]) from None
     except OSError as exc:
         raise ConfigError(str(path), [ConfigIssue((), f"cannot read file: {exc}")]) from None
-    return parse_routing_config(text, source=str(path), env=env)
+    return parse_routing_config(text, source=str(path), env=env, base_dir=path.parent)
 
 
 def parse_routing_config(
-    text: str, *, source: str = "<string>", env: Mapping[str, str] | None = None
+    text: str,
+    *,
+    source: str = "<string>",
+    env: Mapping[str, str] | None = None,
+    base_dir: Path | None = None,
 ) -> LoadedConfig:
+    """``base_dir`` resolves the ``pricing`` path (default: the working directory)."""
     environ: Mapping[str, str] = os.environ if env is None else env
     data, lines, issues = _compose(text, source)
     if data is None:
@@ -114,15 +130,43 @@ def parse_routing_config(
 
     errors, warnings, disabled = _check_semantics(config, environ, lines)
     issues.extend(errors)
+    prices, pricing_path, pricing_text = None, None, ""
+    if config.pricing is not None:
+        pricing_path = (base_dir or Path.cwd()) / config.pricing
+        try:
+            prices, pricing_text = load_pricing(pricing_path)
+        except PricingError as exc:
+            issues.append(ConfigIssue(("pricing",), str(exc), _line_for(("pricing",), lines)))
+        else:
+            issues.extend(_check_prices(config, prices, lines))
     if issues:
         raise ConfigError(source, issues)
+    digest = hashlib.sha256(text.encode())
+    digest.update(pricing_text.encode())
     return LoadedConfig(
         config=config,
         source=source,
-        version=hashlib.sha256(text.encode()).hexdigest()[:12],
+        version=digest.hexdigest()[:12],
         warnings=tuple(warnings),
         disabled_providers=frozenset(disabled),
+        pricing=prices,
+        pricing_path=pricing_path,
     )
+
+
+def _check_prices(
+    config: RoutingConfig, prices: PriceTable, lines: Mapping[ConfigPath, int]
+) -> list[ConfigIssue]:
+    """With a pricing file, every model must have a price, so no cost is silently 0."""
+    return [
+        ConfigIssue(
+            ("models", name),
+            f"no price for '{name}' in pricing file version {prices.version}",
+            _line_for(("models", name), lines),
+        )
+        for name in config.models
+        if name not in prices
+    ]
 
 
 # --- pass 1: YAML -> plain data, plus a map of path -> line -----------------------------
@@ -287,7 +331,8 @@ def _check_semantics(
     checker.check_model_names()
     checker.check_timeouts()
     for name, alias in config.aliases.items():
-        checker.check_alias(name, alias)
+        checker.check_route(("aliases", name), alias)
+    checker.check_rules()
     return checker.errors, checker.warnings, checker.disabled
 
 
@@ -307,7 +352,19 @@ class _SemanticChecker:
         bucket.append(ConfigIssue(path, message, _line_for(path, self.lines), severity))
 
     def check_providers(self) -> None:
+        defaults = self.config.defaults
         for name, provider in self.config.providers.items():
+            for field, base, override in (
+                ("retry", defaults.retry, provider.retry),
+                ("breaker", defaults.breaker, provider.breaker),
+            ):
+                try:
+                    merge_policy(base, override)
+                except ValidationError as exc:
+                    self.issue(
+                        ("providers", name, field),
+                        f"effective {field} policy is invalid: {_first_message(exc)}",
+                    )
             if not provider.api_key_env or self.env.get(provider.api_key_env):
                 continue
             path: ConfigPath = ("providers", name, "api_key_env")
@@ -344,31 +401,131 @@ class _SemanticChecker:
             try:
                 merge_timeouts(defaults, provider.timeouts, model.timeouts)
             except ValidationError as exc:
-                message = exc.errors()[0]["msg"].removeprefix("Value error, ")
                 path: ConfigPath = (
                     ("models", key, "timeouts") if model.timeouts else ("models", key)
                 )
-                self.issue(path, f"effective timeouts are invalid: {message}")
+                self.issue(path, f"effective timeouts are invalid: {_first_message(exc)}")
 
-    def check_alias(self, name: str, alias: AliasConfig) -> None:
-        base: ConfigPath = ("aliases", name)
+    def check_route(self, base: ConfigPath, route: RouteSpec) -> ModelKind | None:
+        """Check an alias or an inline rule route; return its kind if it is unambiguous."""
         kinds: set[ModelKind] = set()
         resolved_targets = self._check_refs(
-            [((*base, "targets", i, "model"), t.model) for i, t in enumerate(alias.targets)],
+            [((*base, "targets", i, "model"), t.model) for i, t in enumerate(route.targets)],
             "targets",
             kinds,
         )
-        self._check_refs(
-            [((*base, "fallbacks", j), fb) for j, fb in enumerate(alias.fallbacks)],
+        resolved_fallbacks = self._check_refs(
+            [((*base, "fallbacks", j), fb) for j, fb in enumerate(route.fallbacks)],
             "fallbacks",
             kinds,
         )
         if len(kinds) > 1:
             self.issue(base, "mixes chat and embedding models")
-        if resolved_targets is not None and all(
-            model.split("/", 1)[0] in self.disabled for model in resolved_targets
+        candidates = [*(resolved_targets or ()), *(resolved_fallbacks or ())]
+        if (
+            resolved_targets is not None
+            and resolved_fallbacks is not None
+            and all(model.split("/", 1)[0] in self.disabled for model in candidates)
         ):
-            self.issue(base, "every target's provider is disabled; requests will fail", "warning")
+            self.issue(
+                base, "every candidate's provider is disabled; requests will fail", "warning"
+            )
+        if route.hedge is not None:
+            self._check_hedge(base, route, resolved_targets)
+        return next(iter(kinds)) if len(kinds) == 1 else None
+
+    def _check_hedge(
+        self, base: ConfigPath, route: RouteSpec, resolved_targets: list[str] | None
+    ) -> None:
+        assert route.hedge is not None  # noqa: S101 (narrowing for the type checker)
+        path: ConfigPath = (*base, "hedge")
+        if not route.fallbacks:
+            self.issue(path, "hedging needs at least one fallback to hedge to")
+        if ModelKind.EMBEDDING in self._kinds(resolved_targets or []):
+            self.issue(path, "hedging applies to chat completions only")
+        for model in resolved_targets or ():
+            first_token = self._first_token(model)
+            if first_token is not None and route.hedge.after >= first_token:
+                self.issue(
+                    path,
+                    f"'after' ({route.hedge.after:g}s) is not shorter than the first-token "
+                    f"timeout of {model} ({first_token:g}s), so it never hedges",
+                    "warning",
+                )
+
+    def check_rules(self) -> None:
+        seen: dict[str, int] = {}
+        catch_all: str | None = None
+        for i, rule in enumerate(self.config.rules):
+            base: ConfigPath = ("rules", i)
+            if rule.name in seen:
+                self.issue((*base, "name"), f"rule name '{rule.name}' is used twice")
+            seen.setdefault(rule.name, i)
+            if catch_all is not None:
+                self.issue(
+                    base,
+                    f"unreachable: rule '{catch_all}' before it matches every request",
+                    "warning",
+                )
+            if rule.when == type(rule.when)():
+                catch_all = catch_all or rule.name
+            when_kind = self._check_rule_model(base, rule)
+            use_kind = self._check_rule_action(base, rule)
+            if when_kind is not None and use_kind is not None and when_kind is not use_kind:
+                self.issue(
+                    (*base, "use"),
+                    f"routes {when_kind.value} requests to {use_kind.value} models",
+                )
+
+    def _check_rule_model(self, base: ConfigPath, rule: Rule) -> ModelKind | None:
+        requested = rule.when.model
+        if requested is None:
+            return None
+        if requested in self.config.aliases:
+            return self._route_kind(self.config.aliases[requested])
+        if requested in self.config.models:
+            return self.config.models[requested].kind
+        hint = _suggest(requested, [*self.config.aliases, *self.config.models])
+        self.issue(
+            (*base, "when", "model"),
+            f"no alias or model named '{requested}'" + _did_you_mean(hint),
+        )
+        return None
+
+    def _check_rule_action(self, base: ConfigPath, rule: Rule) -> ModelKind | None:
+        action = rule.use
+        if action.alias is not None:
+            alias = self.config.aliases.get(action.alias)
+            if alias is None:
+                hint = _suggest(action.alias, list(self.config.aliases))
+                self.issue(
+                    (*base, "use", "alias"),
+                    f"unknown alias '{action.alias}'" + _did_you_mean(hint),
+                )
+                return None
+            return self._route_kind(alias)
+        route = action.route()
+        return None if route is None else self.check_route((*base, "use"), route)
+
+    def _route_kind(self, route: RouteSpec) -> ModelKind | None:
+        kinds = self._kinds([t.model for t in route.targets])
+        return next(iter(kinds)) if len(kinds) == 1 else None
+
+    def _kinds(self, models: Sequence[str]) -> set[ModelKind]:
+        return {self.config.models[m].kind for m in models if m in self.config.models}
+
+    def _first_token(self, model: str) -> float | None:
+        config = self.config.models.get(model)
+        provider = self.config.providers.get(model.partition("/")[0])
+        if config is None or provider is None:
+            return None
+        try:
+            merged = merge_timeouts(
+                self.config.defaults.timeouts, provider.timeouts, config.timeouts
+            )
+        except ValidationError:
+            return None  # reported by check_timeouts
+        return merged.first_token
 
     def _check_refs(
         self, refs: list[tuple[ConfigPath, str]], section: str, kinds: set[ModelKind]
@@ -389,6 +546,10 @@ class _SemanticChecker:
                 continue
             kinds.add(config.kind)
         return [model for _, model in refs] if all_resolved else None
+
+
+def _first_message(exc: ValidationError) -> str:
+    return str(exc.errors()[0]["msg"]).removeprefix("Value error, ")
 
 
 def _did_you_mean(hint: str | None) -> str:

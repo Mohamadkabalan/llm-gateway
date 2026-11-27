@@ -171,7 +171,7 @@ async def _events(
 ) -> AsyncGenerator[StreamEvent]:
     decoder = SSEDecoder()
     async for raw in response.iter_chunks():
-        read_at = time.perf_counter()
+        read_at = timings.last_read = time.perf_counter()
         for sse in decoder.feed(raw):
             try:
                 data = orjson.loads(sse.data)

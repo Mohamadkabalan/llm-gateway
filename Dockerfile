@@ -37,6 +37,7 @@ RUN groupadd --system --gid 10001 switchboard \
 
 COPY --from=build --chown=root:root /app/.venv /app/.venv
 COPY --chown=root:root config /app/config
+COPY --chown=root:root migrations /app/migrations
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \

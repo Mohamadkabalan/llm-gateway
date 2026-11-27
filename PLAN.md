@@ -1,6 +1,6 @@
 # Switchboard: implementation plan
 
-**Status:** approved 2026-11-27. **Progress:** Phases 0–2 complete. The Phase 1 decision gate (§0.1) is still open: it needs a benchmark run on a quiet machine. Phase notes are in §20. You chose Python, a Next.js admin UI and the repo name `llm-gateway`, and left the other open questions to me; §20 records how I resolved them. Measured results live in `bench/results/` and the ADRs, each with the command that produced it. Every other number in this file is a provider fact (with a source), a config default, or an explicit *target*.
+**Status:** approved 2026-11-27. **Progress:** Phases 0–4 complete. The Phase 1 decision gate (§0.1) is still open: it needs a benchmark run on a quiet machine. Phase notes are in §20. You chose Python, a Next.js admin UI and the repo name `llm-gateway`, and left the other open questions to me; §20 records how I resolved them. Measured results live in `bench/results/` and the ADRs, each with the command that produced it. Every other number in this file is a provider fact (with a source), a config default, or an explicit *target*.
 
 Switchboard is a self-hostable LLM gateway. Apps call one OpenAI-compatible endpoint with a virtual key. The gateway:
 
@@ -108,9 +108,10 @@ flowchart LR
 |---|---|---|
 | `api/` | FastAPI routers, OpenAI error envelope, SSE writer, size limits, request IDs | everything below via the pipeline |
 | `schemas/` | OpenAI-compatible request/response models (the IR), normalized stream events | nothing |
-| `routing/` | Config models, loader and validation, hot reload, rule engine, A/B selection, capability filter → `RoutePlan` | `schemas` |
+| `routing/` | Config models, loader and validation, rule engine, A/B selection, capability filter → `RoutePlan` | `schemas` |
+| `reload.py` | The active routing snapshot (table + adapters) and hot reload: content watch, `SIGHUP` (ADR-0013) | `routing`, `providers`, `reliability` |
 | `providers/` | `ProviderAdapter` protocol, OpenAI / Anthropic / Ollama adapters, the upstream HTTP transport (`http.py`, aiohttp, ADR-0012), SSE decoding, error classification, the thinking sidecar (`thinking.py`, ADR-0009) | `schemas`, `routing` (config and target types only), a Redis client for the sidecar |
-| `reliability/` | Executor (timeouts, retries, fallback, hedging), circuit breaker, backoff, retry budget | `providers`, `storage` |
+| `reliability/` | Executor (timeouts, retries, fallback, hedging, refusal fallback), the failure table, circuit breakers (Redis + in-process, ADR-0004), backoff, retry and hedge budgets, the idle watchdog | `providers`, `routing`, Redis |
 | `cache/` | Key normalization, exact cache (Redis), semantic cache (pgvector), stream replay | `storage`, `providers` (embeddings) |
 | `auth/` | Key format, hashing, lookup, in-process key cache, invalidation listener | `storage` |
 | `limits/` | Token buckets (RPM/TPM), budget reservation and settlement (Lua) | `storage` |
@@ -224,6 +225,8 @@ The steps in detail:
 | 401/403 from provider (our credentials are bad) | no | yes | yes, plus an error log |
 | 400 context length exceeded | no | only to candidates with larger `max_input_tokens` | no |
 | Other 400/404/413/422 | no | no; returned to the client in OpenAI shape | no |
+| Request the adapter cannot express for this provider (never sent; Phase 2's `invalid_request`) | no | yes | no |
+| Target's breaker is open (no call made) | — | yes | — |
 | Refusal (`stop_reason: "refusal"`, HTTP 200) before commit | no | only if the route sets `fallback_on_refusal: true` | no |
 | Any failure after commit | no | no; SSE error event | yes, if it was the provider's fault |
 | Client disconnect | — | — (upstream cancelled) | no |
@@ -494,7 +497,7 @@ rules:                                     # evaluated top to bottom; first matc
   - every chat/embedding model has a price in the active pricing file (a warning for `ollama/*`)
 
   All errors are reported together, each with its YAML path and line number. A failed startup exits non-zero with that list.
-- **Hot reload.** Triggered by a file watch (`watchfiles`), `SIGHUP`, or `POST /admin/api/config/reload`. The steps are parse → validate → build an immutable `RoutingTable` → swap one reference atomically. Requests already in flight keep the table they started with. An invalid reload keeps the old table, logs every error and increments `switchboard_config_reloads_total{result="error"}`. The active config hash is exposed as `switchboard_config_info{version}` and in `/ready`.
+- **Hot reload.** Triggered by a content check of the file every second (ADR-0013; it replaced the planned `watchfiles` watch, see the Phase 3 notes), `SIGHUP` (`make reload`), or, from Phase 6, `POST /admin/api/config/reload`. The steps are parse → validate → build an immutable `RoutingTable` → swap one reference atomically. Requests already in flight keep the table they started with. An invalid reload keeps the old table, logs every error and increments `switchboard_config_reloads_total{result="error"}`. The active config hash is exposed as `switchboard_config_info{version}` and in `/ready`.
 
 ---
 
@@ -514,9 +517,9 @@ rules:                                     # evaluated top to bottom; first matc
   - Each provider has a retry budget: retries are capped at `budget_ratio` of recent requests, per process. This stops retry storms when a provider degrades.
 - **Circuit breaker.**
   - One breaker per `provider/model`, with state in Redis so that every replica agrees.
-  - **Reads cost no extra round trip:** breaker states are fetched in the admission pipeline.
-  - **Writes are fire-and-forget:** a Lua script updates rolling-window counters (10 s buckets) and makes transitions atomically.
-  - In half-open, an atomic `INCR` on a probe counter gates which requests become probes.
+  - **Reads cost no extra round trip:** each replica keeps a local view of every breaker, updated from each Lua reply; only an expired open breaker and half-open probing ask Redis (ADR-0004).
+  - **Writes are fire-and-forget:** a Lua script updates rolling-window counters (10 buckets per window) and makes transitions atomically.
+  - In half-open, an atomic `HINCRBY` on a probe counter gates which requests become probes.
   - If Redis is unreachable, each process falls back to an in-process breaker.
 
   ```mermaid
@@ -578,7 +581,7 @@ rules:                                     # evaluated top to bottom; first matc
 - **Rate limits.** Token buckets in Redis Lua using Redis `TIME`, so there is no clock skew between replicas.
   - **Buckets:** RPM and TPM, each per key and optionally per team.
   - **Atomicity:** one script checks every bucket and only then deducts from all of them. A request rejected by the TPM bucket therefore costs nothing from the RPM bucket.
-  - **Estimating TPM:** TPM is charged at admission with an estimate, `prompt estimate + min(max_tokens, model default)`.
+  - **Estimating TPM:** TPM is charged at admission with an estimate: the prompt estimate plus the request's `max_tokens`, else the model's default, else 4096, capped at the model's `max_output_tokens`.
   - **Correcting TPM:** settlement corrects the bucket with actual usage. A bucket may go into debt, bounded at minus one burst.
 - **Budgets.**
   - **Periods:** monthly, by UTC calendar month. Keys and teams each have a **hard** limit (block) and a **soft** limit (alert).
@@ -708,13 +711,16 @@ CREATE TABLE audit_log (id bigserial PRIMARY KEY, at timestamptz NOT NULL DEFAUL
 
 | Key | Type | Purpose |
 |---|---|---|
-| `rl:{scope}:{id}:{rpm\|tpm}` | hash `{tokens, ts}` | token bucket |
-| `spend:{scope}:{id}:{yyyymm}` | hash `{spent, reserved}` (nano-USD) | budgets |
-| `alert:{scope}:{id}:{yyyymm}:{level}` | string, `SET NX` | one soft alert per period |
-| `cb:{provider/model}` / `cb:{…}:w:{bucket}` / `cb:{…}:probes` | hash / counters | circuit breaker |
+| `{t:<team>}:rl:{key:<id>\|team}:{rpm\|tpm}` | hash `{tokens, ts}` | token bucket |
+| `{t:<team>}:spend:{key:<id>\|team}:{yyyymm}` | hash `{spent, reserved}` (nano-USD) | budgets (ADR-0005) |
+| `{t:<team>}:resv:{key:<id>\|team}:{yyyymm}` | sorted set: `request\|estimate` by expiry | reservations a crashed replica never settled expire |
+| `{t:<team>}:alert:{key:<id>\|team}:{yyyymm}:soft` | string, `SET NX` | one soft alert per period |
+| `cb:{provider/model}` | hash (state, cooldown, probe counts, a ring of 10 window buckets) | circuit breaker (ADR-0004) |
 | `cache:{scope}:{sha256}` | string (zstd), TTL | exact cache |
-| `think:{team}:{sha256(tool ids)}` | string, TTL 1 h | thinking sidecar |
+| `thinking:{sha256(team, tool ids)}` | string, TTL 1 h | thinking sidecar (ADR-0009) |
 | `chan:invalidate` | pub/sub | key revocation and team limit changes |
+
+Every limits key of a team shares the hash tag `{t:<team id>}`, so the admission and settlement scripts work on Redis Cluster.
 
 ---
 
@@ -1142,6 +1148,8 @@ At the end of every phase I run `make lint` and `make test`, fix what fails, wri
 | 0009 | Thinking sidecar for tool loops |
 | 0010 | Tempo over Jaeger |
 | 0011 | k6 + xk6-sse for load testing |
+| 0012 | aiohttp as the upstream transport (Phase 1) |
+| 0013 | Config reload by content checks, not file events (Phase 3) |
 
 ---
 
@@ -1254,3 +1262,120 @@ run that produced them; raw files are in `bench/results/`.
   round trip through the fake Anthropic provider.
 - **Still to do with your keys:** `make record-fixtures` and `make test-live` (real
   `claude-sonnet-5-5` and OpenAI through the gateway). Both make a handful of small calls.
+
+### Phase 3 notes (2026-11-27)
+
+- **What the Phase 3 code covers.**
+  - `routing/table.py` turns a request into a `RoutePlan`: rules, weighted or sticky
+    A/B, fallbacks, and the capability filter, which now skips candidates instead of
+    refusing the request.
+  - `reliability/` holds the executor (retries, retry budget, fallback, hedging,
+    refusal fallback), the failure table (`policy.py`), backoff, budgets, the circuit
+    breakers (`breaker.py`) and the idle watchdog.
+  - `reload.py` handles hot reload.
+  - The full reference is `docs/ROUTING.md`.
+- **Breaker buckets.** The plan said "10 s buckets". A ring of window-sized buckets made
+  a 10 s window a tumbling one: in the first stack test, five failures straddled a bucket
+  boundary and the breaker never opened. Every window is now 10 equal buckets, so it
+  slides in tenths of its length. A scenario case for exactly this runs against both
+  stores.
+- **Breaker reads.** There is no admission pipeline before Phase 4, so instead of reading
+  breaker state there, each replica keeps a local view from every Lua reply (ADR-0004).
+  The cost is a short lag before a replica sees a breaker that another replica opened.
+- **Hot reload.** `watchfiles` was replaced by a content check every second
+  (ADR-0013): on WSL it polls with one-second timestamps and missed a second save in the
+  same second. `SIGHUP` reloads too (`make reload`). The admin endpoint moves to Phase 6,
+  where the admin API lives. It will reach every replica over Redis pub/sub, alongside
+  Phase 4's key invalidation channel.
+- **Timeouts.**
+  - `idle` is now enforced by the gateway, after the commit point and between upstream
+    reads, independent of `first_token`. Time spent writing to a slow client does not
+    count.
+  - The primary's `total` bounds the whole request, retries and fallbacks included.
+  - Keep-alive pings start after `keepalive_after` for streams. Once they start, the
+    routing headers are not sent (the status line went out before routing finished).
+- **Extra failure rows** (§2.2): a request the adapter cannot express for a provider
+  (never sent) may fall back, and an open breaker skips the candidate. Both are in
+  `reliability/policy.py`, which every row's unit test reads.
+- **`provider_options`.** OpenAI and Ollama adapters now merge only their own entry and
+  never forward the field. Before Phase 3, a request carrying Anthropic options that
+  fell back to OpenAI would have been rejected for an unknown parameter.
+- **Fake provider and stack.** Faults can target upstream models (`fault_models`), so
+  one fake plays a failing primary and a healthy fallback. Its control API is published
+  on `127.0.0.1:7800`. The shipped config gains `fake-flaky` (a quick-tripping breaker),
+  the `fake-fallback` alias and one example rule (`X-Switchboard-Tags: via-claude`).
+- **Acceptance.**
+  - Every Phase 3 scenario runs in the component suite (real sockets, the real fake):
+    - 503 → fallback;
+    - first-token timeout → fallback;
+    - failure before commit invisible to the SDK;
+    - failure after commit → SDK error;
+    - breaker open → half-open → closed;
+    - an invalid reload keeps the old config and counts the error;
+    - the hedge wins and the loser is cancelled (fake stats).
+  - Against the compose stack (`make test-integration`):
+    - failover;
+    - the Redis breaker end to end;
+    - the scenario table against real Redis, plus 50 concurrent half-open admits;
+    - two replicas sharing a breaker;
+    - the tag rule.
+
+### Phase 4 notes (2026-11-27)
+
+- **What the Phase 4 code covers.**
+  - `auth/`: the key format, HMAC hashing, the Postgres store, the cached resolver with
+    pub/sub revocation, and key management.
+  - `limits/`: the admission and settlement Lua, the limiter, and soft alerts.
+  - `accounting/`: pricing and the cost calculator, the usage writer, and the
+    per-request ledger.
+  - `storage/migrate.py` and `migrations/0001_keys_and_usage.sql` hold the schema.
+  - The CLI adds `migrate`, `create-team`, `create-key`, `revoke-key` and `ensure-key`.
+  - The full reference is `docs/ACCOUNTING.md`; ADR-0005 covers budget reservations
+    and ADR-0006 the usage queue.
+- **The static dev key is gone.** `/v1` accepts only virtual keys. `make up` runs a
+  one-shot `setup` service: migrations, then `ensure-key` for team `demo` (with a $5
+  monthly budget) using the secret `make secrets` puts in `.env` as
+  `SWITCHBOARD_DEMO_KEY`. The bench stack does the same with its own Postgres and
+  Redis, so the Phase 1 gate will be decided on the full path (auth, limits,
+  accounting), as §16.1 specifies.
+- **Reservations expire.** They are also members of a sorted set scored by expiry
+  (the request deadline plus a minute), so a replica that dies mid-request cannot hold
+  budget forever. Spend counters exist only for scopes with a budget, so keys without
+  one never touch Redis for budgets. Breaker state is not read in admission: each
+  replica already has it locally (ADR-0004).
+- **One Lua implementation.** Unit and component tests run the real scripts on
+  `fakeredis` (with Lua, a new dev dependency); the integration suite runs them on
+  Redis. The property tests in `tests/unit/test_limits.py` check the overshoot bound
+  and that no reservation leaks.
+- **Pricing, re-verified 2026-11-27.**
+  - **Anthropic.** The platform pricing page matches §3.8. Haiku 5.5 is tiered at
+    100,000 prompt tokens, cache reads and writes included.
+  - **OpenAI.** The developers pricing page has gpt-5.4-mini at $0.75 / $4.50 with
+    $0.075 cached input, and text-embedding-3-small at $0.02.
+  - **Not priced yet.** gpt-6.2-sol and gpt-6-luna now have a long-context tier above
+    272K input tokens and cache writes at 30-minute and 12-hour durations. The usage
+    model has no buckets for those writes, so they are left out of
+    `config/pricing/2026-11-27.yaml` until it does; no routed model needs them.
+    Anthropic's 1.1x `inference_geo: "us"` multiplier, fast mode and server-tool fees
+    are not modelled either (`docs/ACCOUNTING.md`, known gaps).
+- **Ledger rows.** Refusals after authentication (bad request, unknown or forbidden
+  model, rate limit, budget) are recorded too, with status `invalid_request`,
+  `rate_limited`, `budget_blocked`, or `unavailable` for the gateway's own 503s. A
+  forbidden model is a 404 indistinguishable from an unknown one.
+- **Resilience checks.**
+  - Postgres paused: requests keep being served (keys stay cached, with up to 5
+    minutes of stale-if-error), and the queued rows land after unpause.
+  - Revocation takes effect within a second over pub/sub.
+  - With Redis down, rate limits fail open, and budgets fail open unless
+    `SWITCHBOARD_BUDGET_ON_REDIS_FAILURE=closed`.
+- **Acceptance.**
+  - Cost unit tests match hand-computed values from the verified rows.
+  - The budget property tests hold.
+  - Against the compose stack:
+    - the hard limit gives 429 `insufficient_quota` with `x-should-retry: false`, and
+      the Python SDK (`max_retries=3`) sends it once;
+    - a soft alert fires once: one `budget_alerts` row and one webhook;
+    - RPM and TPM 429s carry `retry-after` and `x-ratelimit-*`;
+    - one usage row per request, with the expected tokens and cost;
+    - the Postgres pause test;
+    - a revoked key is rejected within 1 s.

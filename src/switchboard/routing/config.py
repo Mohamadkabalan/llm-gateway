@@ -5,7 +5,8 @@ silently ignored setting. Durations accept ``250ms``, ``2s``, ``5m``, ``1h`` or 
 number of seconds. Cross-references (alias → model → provider) are checked in
 ``switchboard.routing.loader``, which can report YAML line numbers.
 
-Later phases extend this schema with rules, caching and guardrails (PLAN.md §4).
+Later phases extend this schema with caching and guardrails (PLAN.md §4). The full
+reference is ``docs/ROUTING.md``.
 """
 
 import re
@@ -67,19 +68,34 @@ class TimeoutOverrides(StrictModel):
 def merge_timeouts(base: Timeouts, *overrides: TimeoutOverrides | None) -> Timeouts:
     """Apply overrides in order (provider, then model). Raises ``ValidationError`` if
     the merged result is inconsistent."""
+    return merge_policy(base, *overrides)
+
+
+def merge_policy[P: BaseModel](base: P, *overrides: BaseModel | None) -> P:
+    """``base`` with the set fields of each override applied in order, re-validated."""
     values = base.model_dump()
     for override in overrides:
         if override is not None:
             values.update(override.model_dump(exclude_none=True))
-    return Timeouts.model_validate(values)
+    return type(base).model_validate(values)
 
 
 class RetryPolicy(StrictModel):
+    """Retries of the same target (PLAN.md §5). ``max_attempts`` counts the first try."""
+
     max_attempts: int = Field(default=2, ge=1, le=10)
     base_delay: Duration = 0.25
     max_delay: Duration = 4.0
     honor_retry_after_up_to: Duration = 10.0
-    budget_ratio: float = Field(default=0.2, ge=0, le=1)
+    budget_ratio: float = Field(
+        default=0.2, ge=0, le=1, description="Retries per provider, as a share of its requests."
+    )
+    budget_min_retries: int = Field(
+        default=10,
+        ge=0,
+        description="Retries per provider always allowed per budget window, so a quiet "
+        "provider can still be retried.",
+    )
 
     @model_validator(mode="after")
     def _delays_ordered(self) -> Self:
@@ -88,7 +104,22 @@ class RetryPolicy(StrictModel):
         return self
 
 
+class RetryOverrides(StrictModel):
+    max_attempts: int | None = Field(default=None, ge=1, le=10)
+    base_delay: Duration | None = None
+    max_delay: Duration | None = None
+    honor_retry_after_up_to: Duration | None = None
+    budget_ratio: float | None = Field(default=None, ge=0, le=1)
+    budget_min_retries: int | None = Field(default=None, ge=0)
+
+
+BREAKER_SLOTS = 10  # the rolling window is counted in this many equal buckets
+
+
 class BreakerPolicy(StrictModel):
+    """One circuit breaker per ``provider/model`` (PLAN.md §5). The window slides in
+    steps of a tenth of its length."""
+
     window: Duration = 30.0
     min_requests: int = Field(default=20, ge=1)
     failure_rate: float = Field(default=0.5, gt=0, le=1)
@@ -100,7 +131,22 @@ class BreakerPolicy(StrictModel):
     def _cooldowns_ordered(self) -> Self:
         if self.max_cooldown < self.cooldown:
             raise ValueError("'max_cooldown' must be >= 'cooldown'")
+        if self.window < 1:
+            raise ValueError("'window' must be at least 1s")
         return self
+
+    @property
+    def bucket_seconds(self) -> float:
+        return self.window / BREAKER_SLOTS
+
+
+class BreakerOverrides(StrictModel):
+    window: Duration | None = None
+    min_requests: int | None = Field(default=None, ge=1)
+    failure_rate: float | None = Field(default=None, gt=0, le=1)
+    cooldown: Duration | None = None
+    max_cooldown: Duration | None = None
+    half_open_probes: int | None = Field(default=None, ge=1)
 
 
 class Defaults(StrictModel):
@@ -144,6 +190,8 @@ class ProviderConfig(StrictModel):
         "instead of failing startup.",
     )
     timeouts: TimeoutOverrides | None = None
+    retry: RetryOverrides | None = None
+    breaker: BreakerOverrides | None = None
     pool: PoolConfig = PoolConfig()
     thinking_passback: bool = Field(
         default=True,
@@ -158,8 +206,8 @@ class ModelKind(StrEnum):
 
 
 class Capabilities(StrictModel):
-    """What a model accepts. Requests needing more get a 400 naming the gap (Phase 3:
-    such candidates are skipped instead, so a fallback can serve the request)."""
+    """What a model accepts. A candidate that cannot serve a request is skipped, so a
+    fallback that can serves it; with none left the client gets a 400 naming the gap."""
 
     tools: bool = True
     vision: bool = False
@@ -195,16 +243,117 @@ class Sticky(StrEnum):
     END_USER = "end_user"
 
 
-class AliasConfig(StrictModel):
-    description: str | None = None
+class HedgePolicy(StrictModel):
+    """Start the next candidate in parallel if the first has not produced a first token
+    after ``after``. The first to commit wins; the other is cancelled."""
+
+    after: Duration
+    max_ratio: float = Field(
+        default=0.1, gt=0, le=1, description="At most this share of the route's requests hedge."
+    )
+
+
+class RouteSpec(StrictModel):
+    """Where requests go: an alias, or the inline ``use`` of a rule."""
+
     targets: list[Target] = Field(min_length=1)
     sticky: Sticky = Sticky.NONE
     fallbacks: list[str] = Field(default_factory=list)
+    hedge: HedgePolicy | None = None
+    fallback_on_refusal: bool = False
+
+
+class AliasConfig(RouteSpec):
+    description: str | None = None
+
+
+class TokenBounds(StrictModel):
+    lt: int | None = Field(default=None, ge=0)
+    lte: int | None = Field(default=None, ge=0)
+    gt: int | None = Field(default=None, ge=0)
+    gte: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _some_bound(self) -> Self:
+        if all(v is None for v in (self.lt, self.lte, self.gt, self.gte)):
+            raise ValueError("set at least one of 'lt', 'lte', 'gt', 'gte'")
+        return self
+
+    def contains(self, value: int) -> bool:
+        return (
+            (self.lt is None or value < self.lt)
+            and (self.lte is None or value <= self.lte)
+            and (self.gt is None or value > self.gt)
+            and (self.gte is None or value >= self.gte)
+        )
+
+
+class RuleMatch(StrictModel):
+    """Every condition that is set must hold. An empty ``when`` matches every request."""
+
+    model: str | None = Field(default=None, description="The requested alias or model.")
+    key: str | None = None
+    team: str | None = None
+    tags_any: list[str] | None = Field(default=None, min_length=1)
+    tags_all: list[str] | None = Field(default=None, min_length=1)
+    prompt_tokens: TokenBounds | None = None
+    has_tools: bool | None = None
+    has_images: bool | None = None
+    stream: bool | None = None
+
+
+class RuleAction(StrictModel):
+    """Either ``alias`` or an inline route (``targets`` and optionally ``fallbacks``,
+    ``sticky``, ``hedge``, ``fallback_on_refusal``)."""
+
+    alias: str | None = None
+    targets: list[Target] | None = Field(default=None, min_length=1)
+    sticky: Sticky | None = None
+    fallbacks: list[str] | None = None
+    hedge: HedgePolicy | None = None
+    fallback_on_refusal: bool | None = None
+
+    @model_validator(mode="after")
+    def _alias_xor_targets(self) -> Self:
+        inline = [
+            name
+            for name in ("targets", "sticky", "fallbacks", "hedge", "fallback_on_refusal")
+            if getattr(self, name) is not None
+        ]
+        if self.alias is not None and inline:
+            raise ValueError(f"use either 'alias' or an inline route, not both ({inline[0]})")
+        if self.alias is None and self.targets is None:
+            raise ValueError("set 'alias' or 'targets'")
+        return self
+
+    def route(self) -> RouteSpec | None:
+        """The inline route, or None when the action names an alias."""
+        if self.targets is None:
+            return None
+        return RouteSpec(
+            targets=self.targets,
+            sticky=self.sticky or Sticky.NONE,
+            fallbacks=self.fallbacks or [],
+            hedge=self.hedge,
+            fallback_on_refusal=bool(self.fallback_on_refusal),
+        )
+
+
+class Rule(StrictModel):
+    name: Name
+    when: RuleMatch = RuleMatch()
+    use: RuleAction
 
 
 class RoutingConfig(StrictModel):
     version: Literal[1]
+    pricing: str | None = Field(
+        default=None,
+        description="The active pricing file, relative to this file "
+        "(e.g. pricing/2026-11-27.yaml). Without one, costs are recorded as 0.",
+    )
     defaults: Defaults = Defaults()
     providers: dict[Name, ProviderConfig] = Field(min_length=1)
     models: dict[str, ModelConfig] = Field(default_factory=dict)
     aliases: dict[Name, AliasConfig] = Field(default_factory=dict)
+    rules: list[Rule] = Field(default_factory=list)

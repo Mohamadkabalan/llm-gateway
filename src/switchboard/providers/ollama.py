@@ -11,7 +11,7 @@ from typing import Any
 
 from switchboard.providers.base import CallContext
 from switchboard.providers.errors import ErrorKind, ProviderError
-from switchboard.providers.openai import OpenAIAdapter
+from switchboard.providers.openai import OpenAIAdapter, apply_provider_options
 from switchboard.routing.table import ModelTarget
 from switchboard.schemas.chat import ChatRequest
 from switchboard.schemas.embeddings import EmbeddingRequest
@@ -19,11 +19,13 @@ from switchboard.schemas.embeddings import EmbeddingRequest
 
 class OllamaAdapter(OpenAIAdapter):
     base_path = "/v1"
+    options_key = "ollama"
 
     def prepare_chat(
         self, request: ChatRequest, target: ModelTarget, ctx: CallContext
     ) -> dict[str, Any]:
         body = request.to_upstream_dict()
+        apply_provider_options(body, self.options_key)
         body["model"] = target.upstream_model
         body["stream"] = True
         body["stream_options"] = {"include_usage": True}

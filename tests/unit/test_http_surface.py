@@ -14,6 +14,7 @@ from switchboard.app import build_api, create_app
 from switchboard.lifecycle import Lifecycle
 from switchboard.routing import LoadedConfig
 from tests.conftest import SettingsFactory
+from tests.support import TEST_PEPPER
 
 
 async def test_health_is_always_ok(client: httpx.AsyncClient) -> None:
@@ -44,6 +45,7 @@ async def test_ready_reports_unreachable_dependencies(
     settings = make_settings(
         redis_url="redis://127.0.0.1:1/0",
         database_url="postgresql://u:p@127.0.0.1:1/db",
+        key_pepper=TEST_PEPPER,
         ready_check_timeout_seconds=2,
     )
     app = create_app(settings, routing)

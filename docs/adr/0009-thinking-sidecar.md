@@ -39,8 +39,7 @@ worse than the same loops against Anthropic directly.
 - Agent loops through the gateway keep their reasoning across tool calls, at the cost
   of one Redis GET on requests that end with tool results, and one SET per tool-calling
   turn that thought.
-- The scope is a single shared value until virtual keys exist (Phase 4), when it
-  becomes the team id, so teams never see each other's stored turns.
+- The scope is the key's team id, so teams never see each other's stored turns.
 - Stored blocks contain the encrypted thinking signature and, with
   `display: "omitted"` (the default on current models), no readable reasoning text.
   They are still model output and expire after an hour.

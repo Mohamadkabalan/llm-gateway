@@ -2,8 +2,11 @@
 
 Near pass-through: the client's request is forwarded with its own fields, after
 setting the upstream model name, forcing ``stream: true`` with usage, and replacing
-the deprecated ``max_tokens`` with ``max_completion_tokens``. Subclasses adjust the
-body for OpenAI-compatible servers with fewer features (``providers.ollama``).
+the deprecated ``max_tokens`` with ``max_completion_tokens``. ``provider_options`` is
+never forwarded: its ``openai`` entry is merged into the body, and entries for other
+providers are dropped, so a request written for Anthropic can fall back to OpenAI.
+Subclasses adjust the body for OpenAI-compatible servers with fewer features
+(``providers.ollama``).
 """
 
 import time
@@ -56,6 +59,7 @@ _QUOTA_CODES = frozenset({"insufficient_quota", "billing_hard_limit_reached", "b
 
 class OpenAIAdapter:
     base_path = ""  # appended to the provider's base_url
+    options_key = "openai"  # which provider_options entry applies
 
     def __init__(self, name: str, config: ProviderConfig, *, api_key: str | None) -> None:
         self.name = name
@@ -72,13 +76,14 @@ class OpenAIAdapter:
     def prepare_chat(
         self, request: ChatRequest, target: ModelTarget, ctx: CallContext
     ) -> dict[str, Any]:
-        return build_body(request, target)
+        return build_body(request, target, options_key=self.options_key)
 
     def prepare_embedding(
         self, request: EmbeddingRequest, target: ModelTarget, ctx: CallContext
     ) -> dict[str, Any]:
         body = request.to_upstream_dict()
         body["model"] = target.upstream_model
+        apply_provider_options(body, self.options_key)
         return body
 
     async def embed(
@@ -123,8 +128,11 @@ class OpenAIAdapter:
                 yield event
 
 
-def build_body(request: ChatRequest, target: ModelTarget) -> dict[str, Any]:
+def build_body(
+    request: ChatRequest, target: ModelTarget, *, options_key: str = "openai"
+) -> dict[str, Any]:
     body = request.to_upstream_dict()
+    apply_provider_options(body, options_key)
     body["model"] = target.upstream_model
     body["stream"] = True
     body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
@@ -136,6 +144,20 @@ def build_body(request: ChatRequest, target: ModelTarget) -> dict[str, Any]:
     return body
 
 
+def apply_provider_options(body: dict[str, Any], key: str) -> None:
+    """Remove ``provider_options`` and merge in its entry for this provider type (dict
+    values are merged one level deep, as for Anthropic)."""
+    options = body.pop("provider_options", None)
+    mine = options.get(key) if isinstance(options, dict) else None
+    if not isinstance(mine, dict):
+        return
+    for name, value in mine.items():
+        if isinstance(value, dict) and isinstance(body.get(name), dict):
+            body[name] = {**body[name], **value}
+        else:
+            body[name] = value
+
+
 async def _stream_events(
     response: UpstreamResponse, timings: CallTimings
 ) -> AsyncIterator[StreamEvent]:
@@ -143,7 +165,7 @@ async def _stream_events(
     started = False
     done = False
     async for raw in response.iter_chunks():
-        read_at = time.perf_counter()
+        read_at = timings.last_read = time.perf_counter()
         for sse in decoder.feed(raw):
             if done:
                 continue  # keep reading to EOF so the connection goes back to the pool

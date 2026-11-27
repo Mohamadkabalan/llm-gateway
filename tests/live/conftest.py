@@ -11,12 +11,13 @@ import openai
 import pytest
 from pydantic import SecretStr
 
-from switchboard.app import create_app
+from switchboard.app import Overrides, create_app
 from switchboard.routing import parse_routing_config
 from switchboard.settings import Settings
 from tests.component.conftest import serve
+from tests.support import TEST_KEY, TEST_PEPPER, key_context, key_store
 
-KEY = "sb-live-test"
+KEY = TEST_KEY
 CONFIG = """\
 version: 1
 providers:
@@ -59,7 +60,9 @@ def require(variable: str) -> None:
 @pytest.fixture
 async def gateway() -> AsyncIterator[openai.AsyncOpenAI]:
     routing = parse_routing_config(CONFIG, source="live.yaml", env=dict(os.environ))
-    app = create_app(Settings(dev_api_key=SecretStr(KEY), metrics_port=0), routing)
+    settings = Settings(key_pepper=SecretStr(TEST_PEPPER), metrics_port=0)
+    overrides = Overrides(key_store=key_store((KEY, key_context(KEY))))
+    app = create_app(settings, routing, overrides=overrides)
     async with serve(app) as url:
         client = openai.AsyncOpenAI(base_url=f"{url}/v1", api_key=KEY, max_retries=0, timeout=60)
         try:

@@ -33,7 +33,8 @@ REPO = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose", "-f", str(REPO / "deploy/compose.bench.yaml")]
 K6_IMAGE = "switchboard/k6:2.0.0-sse0.2.0"
 GATEWAY_IMAGE = "switchboard/gateway:dev"
-BENCH_KEY = "sb-bench-local-only"  # matches deploy/compose.bench.yaml; never leaves the box
+# Matches SWITCHBOARD_BENCH_KEY in deploy/compose.bench.yaml; local only, never leaves the box.
+BENCH_KEY = "sb_live_bench0000000000000000000000000000000000000"
 TARGETS = {
     "direct": {"TARGET_URL": "http://fake-provider:8000/v1/chat/completions", "MODEL": "fake-chat"},
     "gateway": {

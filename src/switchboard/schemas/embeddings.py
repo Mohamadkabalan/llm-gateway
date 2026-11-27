@@ -22,5 +22,21 @@ class EmbeddingRequest(BaseModel):
         value = self.input
         return isinstance(value, list) and bool(value) and not isinstance(value[0], str)
 
+    def text_length(self) -> int:
+        """Input size in characters, for routing's prompt-size estimate (a token id
+        counts as four characters, so the estimate is the token count)."""
+        value = self.input
+        if isinstance(value, str):
+            return len(value)
+        total = 0
+        for item in value:
+            if isinstance(item, str):
+                total += len(item)
+            elif isinstance(item, int):
+                total += 4
+            else:
+                total += 4 * len(item)
+        return total
+
     def to_upstream_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_unset=True)

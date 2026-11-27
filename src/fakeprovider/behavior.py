@@ -45,6 +45,11 @@ class Behavior(BaseModel):
 
     fault: Fault = Fault.NONE
     fault_rate: float = Field(default=1.0, ge=0, le=1, description="Probability per request.")
+    fault_models: list[str] | None = Field(
+        default=None,
+        description="Inject the fault only for requests to these upstream model names "
+        "(default: all), so one fake can play a failing primary and a healthy fallback.",
+    )
     fault_after: int = Field(default=0, ge=0, description="Content chunks sent before a fault.")
     status: int = Field(default=500, ge=400, le=599)
     error_code: str | None = Field(default=None, description="e.g. insufficient_quota")

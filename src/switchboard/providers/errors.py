@@ -1,9 +1,10 @@
 """Classified upstream failures (PLAN.md §2.2).
 
 Adapters turn every upstream failure into a ``ProviderError`` with a ``kind``. The
-kind decides two things: whether a retry or fallback may help (used by the executor
-in Phase 3) and what the client sees. A provider's own credentials or quota problem
-is the gateway's fault, not the client's, so it never reaches the client as a 401.
+kind decides two things: whether a retry or fallback may help (the table in
+``switchboard.reliability.policy``) and what the client sees. A provider's own
+credentials or quota problem is the gateway's fault, not the client's, so it never
+reaches the client as a 401.
 """
 
 import email.utils
@@ -24,6 +25,9 @@ class ErrorKind(StrEnum):
     BAD_REQUEST = "bad_request"  # other 4xx: the request itself is wrong
     PROTOCOL = "protocol"  # malformed or truncated upstream response
     INVALID_REQUEST = "invalid_request"  # can't be expressed for this provider; not sent
+    # Raised by the executor, not by adapters:
+    CIRCUIT_OPEN = "circuit_open"  # the target's circuit breaker is open; not sent
+    REFUSAL = "refusal"  # refused before the commit point, on a fallback_on_refusal route
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +50,8 @@ _CLIENT_ERRORS = {
     ErrorKind.BAD_REQUEST: ClientError(400, "invalid_request_error", "upstream_bad_request"),
     ErrorKind.PROTOCOL: ClientError(502, "server_error", "upstream_protocol_error"),
     ErrorKind.INVALID_REQUEST: ClientError(400, "invalid_request_error", "invalid_request"),
+    ErrorKind.CIRCUIT_OPEN: ClientError(503, "server_error", "upstream_circuit_open"),
+    ErrorKind.REFUSAL: ClientError(502, "server_error", "upstream_refusal"),
 }
 
 # Kinds caused by the request itself rather than by the provider.
@@ -66,6 +72,8 @@ _GENERIC_MESSAGES = {
     ErrorKind.OVERLOADED: "The upstream provider returned an error.",
     ErrorKind.AUTH: "The gateway's credentials were rejected by the upstream provider.",
     ErrorKind.PROTOCOL: "The upstream provider sent an invalid response.",
+    ErrorKind.CIRCUIT_OPEN: "Every upstream for this model is temporarily unavailable.",
+    ErrorKind.REFUSAL: "The upstream provider refused the request.",
 }
 
 

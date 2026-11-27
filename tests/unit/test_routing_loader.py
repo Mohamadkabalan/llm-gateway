@@ -78,7 +78,7 @@ def test_unknown_field_suggests_the_right_name_with_line() -> None:
 def test_unknown_top_level_field_lists_allowed_fields() -> None:
     (msg,) = problems(BASE + "zzz: 1\n")
     assert "unknown field 'zzz'" in msg
-    assert "expected one of: aliases, defaults, models, providers, version" in msg
+    assert "expected one of: aliases, defaults, models, pricing, providers, rules, version" in msg
 
 
 def test_wrong_type_points_at_the_value() -> None:
@@ -165,7 +165,17 @@ def test_optional_provider_without_key_is_disabled_with_warnings() -> None:
     assert loaded.disabled_providers == frozenset({"anthropic"})
     messages = [str(w) for w in loaded.warnings]
     assert any("ANTHROPIC_API_KEY is not set; provider disabled" in m for m in messages)
-    assert any("aliases.smart: every target's provider is disabled" in m for m in messages)
+    # smart's fallback (fake/fake-chat) is still enabled, so the alias works.
+    assert not any("aliases.smart" in m for m in messages)
+
+
+def test_alias_with_every_candidate_disabled_is_a_warning() -> None:
+    text = BASE.replace(
+        "    api_key_env: ANTHROPIC_API_KEY\n",
+        "    api_key_env: ANTHROPIC_API_KEY\n    optional: true\n",
+    ).replace("    fallbacks: [fake/fake-chat]\n", "")
+    messages = [str(w) for w in parse_routing_config(text, env={}).warnings]
+    assert any("aliases.smart: every candidate's provider is disabled" in m for m in messages)
 
 
 def test_invalid_alias_name_is_reported() -> None:
@@ -238,3 +248,126 @@ def test_parse_duration_rejects_garbage(raw: object) -> None:
 def test_parse_duration_property(value: int, unit: str) -> None:
     factor = {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
     assert parse_duration(f"{value}{unit}") == pytest.approx(value * factor)
+
+
+# --- rules, hedging and per-provider policies (Phase 3) -------------------------------
+
+RULES_BASE = (
+    BASE
+    + """\
+  fast:
+    targets: [{ model: fake/fake-chat }]
+  vectors:
+    targets: [{ model: fake/fake-embed }]
+rules:
+"""
+)
+
+
+def rule_problems(rules: str) -> list[str]:
+    return problems(RULES_BASE + rules)
+
+
+def test_valid_rules_load() -> None:
+    loaded = parse_routing_config(
+        RULES_BASE
+        + "  - name: short\n"
+        + "    when: { model: smart, prompt_tokens: { lt: 300 }, has_tools: false }\n"
+        + "    use: { alias: fast }\n"
+        + "  - name: tagged\n"
+        + "    when: { tags_any: [pii] }\n"
+        + "    use:\n"
+        + "      targets: [{ model: fake/fake-chat }]\n"
+        + "      fallbacks: [anthropic/claude-sonnet-5-5]\n",
+        env=KEYS,
+    )
+    assert [rule.name for rule in loaded.config.rules] == ["short", "tagged"]
+    assert loaded.warnings == ()
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        (
+            "  - name: a\n    when: { model: smrt }\n    use: { alias: fast }\n",
+            "rules[0].when.model: no alias or model named 'smrt' (did you mean 'smart'?)",
+        ),
+        (
+            "  - name: a\n    when: { model: smart }\n    use: { alias: fsat }\n",
+            "rules[0].use.alias: unknown alias 'fsat' (did you mean 'fast'?)",
+        ),
+        (
+            "  - name: a\n    use: { targets: [{ model: fake/nope }] }\n",
+            "rules[0].use.targets[0].model: unknown model 'fake/nope'",
+        ),
+        (
+            "  - name: a\n    when: { model: smart }\n    use: { alias: vectors }\n",
+            "rules[0].use: routes chat requests to embedding models",
+        ),
+        (
+            "  - name: a\n    when: { model: smart }\n"
+            "    use: { alias: fast, targets: [{ model: fake/fake-chat }] }\n",
+            "use either 'alias' or an inline route, not both (targets)",
+        ),
+        ("  - name: a\n    when: { model: smart }\n    use: {}\n", "set 'alias' or 'targets'"),
+        (
+            "  - name: a\n    when: { prompt_tokens: {} }\n    use: { alias: fast }\n",
+            "set at least one of 'lt', 'lte', 'gt', 'gte'",
+        ),
+        (
+            "  - name: a\n    when: { model: smart }\n    use: { alias: fast }\n"
+            "  - name: a\n    when: { model: fast }\n    use: { alias: smart }\n",
+            "rules[1].name: rule name 'a' is used twice",
+        ),
+        (
+            "  - name: a\n    when: { modle: smart }\n    use: { alias: fast }\n",
+            "unknown field 'modle' (did you mean 'model'?)",
+        ),
+    ],
+)
+def test_rule_problems(rules: str, expected: str) -> None:
+    found = rule_problems(rules)
+    assert any(expected in problem for problem in found), found
+
+
+def test_rules_after_a_catch_all_are_unreachable() -> None:
+    loaded = parse_routing_config(
+        RULES_BASE
+        + "  - name: everything\n    use: { alias: fast }\n"
+        + "  - name: never\n    when: { model: smart }\n    use: { alias: fast }\n",
+        env=KEYS,
+    )
+    (warning,) = loaded.warnings
+    assert "rules[1]: unreachable: rule 'everything' before it matches every request" in str(
+        warning
+    )
+
+
+def test_hedge_needs_a_fallback() -> None:
+    text = BASE.replace("    fallbacks: [fake/fake-chat]\n", "    hedge: { after: 1s }\n")
+    (msg,) = problems(text)
+    assert "aliases.smart.hedge: hedging needs at least one fallback to hedge to" in msg
+
+
+def test_hedge_after_the_first_token_timeout_never_fires() -> None:
+    text = BASE.replace(
+        "    fallbacks: [fake/fake-chat]\n",
+        "    fallbacks: [fake/fake-chat]\n    hedge: { after: 45s }\n",
+    )
+    (warning,) = parse_routing_config(text, env=KEYS).warnings
+    assert "is not shorter than the first-token timeout" in str(warning)
+
+
+def test_provider_policy_overrides_are_checked_after_merging() -> None:
+    text = BASE.replace(
+        "    api_key_env: ANTHROPIC_API_KEY\n",
+        "    api_key_env: ANTHROPIC_API_KEY\n    breaker: { max_cooldown: 5s }\n",
+    )
+    (msg,) = problems(text)
+    assert "providers.anthropic.breaker: effective breaker policy is invalid" in msg
+    assert "'max_cooldown' must be >= 'cooldown'" in msg
+
+
+def test_breaker_window_has_a_floor() -> None:
+    (msg,) = problems(BASE + "defaults:\n  breaker: { window: 500ms }\n")
+    assert "'window' must be at least 1s" in msg

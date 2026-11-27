@@ -1,5 +1,6 @@
 # Routing config for `make bench`: one fake provider, sized for 500+ concurrent streams.
 version: 1
+pricing: pricing/2026-11-27.yaml   # costs are computed on every request, as in production
 
 providers:
   fake:

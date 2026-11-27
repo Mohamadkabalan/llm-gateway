@@ -89,7 +89,7 @@ jobs:
         run: docker run --rm --entrypoint fakeprovider switchboard/gateway:dev --help
       - name: Stack comes up healthy and the gateway is ready
         run: |
-          make dev-key   # .env from .env.example, with a random dev API key
+          make secrets   # .env from .env.example, with a random pepper and demo key
           docker compose -f deploy/compose.yaml --env-file .env up -d --wait --wait-timeout 180
           curl -fsS "http://127.0.0.1:7080/ready"
       - name: Integration tests (OpenAI SDK through the running stack)

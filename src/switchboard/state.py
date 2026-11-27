@@ -7,22 +7,26 @@ import asyncpg
 from fastapi import Request
 from redis.asyncio import Redis
 
+from switchboard.accounting.usage import UsageSink
+from switchboard.auth.resolver import KeyResolver
 from switchboard.lifecycle import Lifecycle
-from switchboard.providers.base import ProviderAdapter
+from switchboard.limits.limiter import Limiter
 from switchboard.readiness import ReadinessChecker
-from switchboard.routing import LoadedConfig
-from switchboard.routing.table import RoutingTable
+from switchboard.reliability.executor import Executor
+from switchboard.reload import ConfigManager
 from switchboard.settings import Settings
 
 
 @dataclass(slots=True)
 class AppState:
     settings: Settings
-    routing: LoadedConfig
     lifecycle: Lifecycle
     readiness: ReadinessChecker
-    routing_table: RoutingTable
-    adapters: dict[str, ProviderAdapter]
+    config: ConfigManager  # the active routing snapshot; swapped on reload
+    executor: Executor
+    keys: KeyResolver
+    limiter: Limiter | None  # None without Redis: no rate limits or budgets
+    usage: UsageSink
     redis: Redis | None = None
     pg_pool: asyncpg.Pool[asyncpg.Record] | None = None
 

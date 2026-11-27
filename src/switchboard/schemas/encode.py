@@ -58,6 +58,7 @@ class ChunkEncoder:
         self._prefix = self._build_prefix()
         self.usage: Usage | None = None
         self.finish_reason: FinishReason | None = None
+        self.output_chars = 0  # text and tool arguments sent, to estimate cost without usage
 
     def _build_prefix(self) -> bytes:
         return b"".join(
@@ -79,8 +80,10 @@ class ChunkEncoder:
         """Return the SSE bytes for one event (empty if the event is not forwarded)."""
         match event:
             case TextDelta(text=text):
+                self.output_chars += len(text)
                 return self._delta(b'{"content":' + orjson.dumps(text) + b"}")
             case ToolCallArgsDelta(tool_index=index, fragment=fragment):
+                self.output_chars += len(fragment)
                 call = {"index": index, "function": {"arguments": fragment}}
                 return self._delta(orjson.dumps({"tool_calls": [call]}))
             case ToolCallStart(tool_index=index, call_id=call_id, name=name):
@@ -141,12 +144,15 @@ class Aggregator:
         self._tool_calls: dict[int, tuple[str, str, list[str]]] = {}
         self.finish_reason: FinishReason | None = None
         self.usage: Usage | None = None
+        self.output_chars = 0
 
     def add(self, event: StreamEvent) -> None:
         match event:
             case TextDelta(text=text):
                 self._text.append(text)
+                self.output_chars += len(text)
             case ToolCallArgsDelta(tool_index=index, fragment=fragment):
+                self.output_chars += len(fragment)
                 if index in self._tool_calls:
                     self._tool_calls[index][2].append(fragment)
             case ToolCallStart(tool_index=index, call_id=call_id, name=name):

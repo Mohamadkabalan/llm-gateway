@@ -7,6 +7,7 @@ SHELL := /bin/bash
 SB_GATEWAY_PORT ?= 7080
 SB_REDIS_PORT ?= 7379
 SB_POSTGRES_PORT ?= 7432
+SB_FAKE_PORT ?= 7800
 POSTGRES_USER ?= switchboard
 POSTGRES_PASSWORD ?= switchboard-local-dev
 POSTGRES_DB ?= switchboard
@@ -24,15 +25,9 @@ help: ## Show this help
 	cp .env.example .env
 	@echo "Created .env from .env.example (add provider keys there if you have them)."
 
-.PHONY: dev-key
-dev-key: .env ## Make sure .env has a SWITCHBOARD_DEV_API_KEY (generates a random one)
-	@if ! grep -qE '^SWITCHBOARD_DEV_API_KEY=.+' .env; then \
-		key="sb-dev-$$(python3 -c 'import secrets; print(secrets.token_hex(16))')"; \
-		grep -v '^SWITCHBOARD_DEV_API_KEY=' .env > .env.tmp || true; \
-		echo "SWITCHBOARD_DEV_API_KEY=$$key" >> .env.tmp; \
-		mv .env.tmp .env; \
-		echo "Generated SWITCHBOARD_DEV_API_KEY in .env"; \
-	fi
+.PHONY: secrets
+secrets: .env ## Make sure .env has a key pepper and a demo API key (random ones if missing)
+	@python3 scripts/ensure_secrets.py .env
 
 .PHONY: install
 install: ## Install dependencies and git hooks
@@ -40,8 +35,9 @@ install: ## Install dependencies and git hooks
 	uv run pre-commit install
 
 .PHONY: dev
-dev: dev-key ## Run the gateway on the host with auto-reload (Postgres/Redis from compose)
+dev: secrets ## Run the gateway on the host with auto-reload (Postgres/Redis from compose)
 	$(COMPOSE) up -d --wait postgres redis
+	$(COMPOSE) run --rm setup
 	SWITCHBOARD_LOG_FORMAT=console \
 	SWITCHBOARD_REDIS_URL=redis://127.0.0.1:$(SB_REDIS_PORT)/0 \
 	SWITCHBOARD_DATABASE_URL=postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:$(SB_POSTGRES_PORT)/$(POSTGRES_DB) \
@@ -77,18 +73,23 @@ test-unit: ## Run unit tests only
 	uv run pytest tests/unit
 
 .PHONY: test-integration
-test-integration: dev-key ## Tests against the running compose stack (run `make up` first)
-	SB_GATEWAY_URL=http://127.0.0.1:$(SB_GATEWAY_PORT) uv run --env-file .env pytest -m integration
+test-integration: secrets ## Tests against the running compose stack (run `make up` first)
+	@# Not echoed: the database URL carries the password from .env.
+	@SB_GATEWAY_URL=http://127.0.0.1:$(SB_GATEWAY_PORT) \
+	SB_DATABASE_URL=postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:$(SB_POSTGRES_PORT)/$(POSTGRES_DB) \
+	SB_REDIS_URL=redis://127.0.0.1:$(SB_REDIS_PORT)/0 \
+	SB_FAKE_URL=http://127.0.0.1:$(SB_FAKE_PORT) \
+	uv run --env-file .env pytest -m integration
 
 .PHONY: cov
 cov: ## Unit and component tests with a coverage report
 	uv run pytest -m "not integration and not live" --cov --cov-report=term-missing
 
 .PHONY: test-sdk-ts
-test-sdk-ts: dev-key ## The OpenAI TypeScript SDK against the running stack (run `make up` first)
+test-sdk-ts: secrets ## The OpenAI TypeScript SDK against the running stack (run `make up` first)
 	cd tests/sdk-ts && npm ci --no-audit --no-fund --ignore-scripts
 	OPENAI_BASE_URL=http://127.0.0.1:$(SB_GATEWAY_PORT)/v1 \
-	OPENAI_API_KEY="$$(grep '^SWITCHBOARD_DEV_API_KEY=' .env | cut -d= -f2-)" \
+	OPENAI_API_KEY="$$(grep '^SWITCHBOARD_DEMO_KEY=' .env | cut -d= -f2-)" \
 	node tests/sdk-ts/tool_roundtrip.mjs
 
 .PHONY: test-live
@@ -102,7 +103,7 @@ record-fixtures: ## Record real provider streams as test fixtures; keys from .en
 # --- stack -----------------------------------------------------------------------------
 
 .PHONY: up
-up: dev-key ## Build and start the full stack, waiting until every service is healthy
+up: secrets ## Build and start the full stack, waiting until every service is healthy
 	$(COMPOSE) up -d --build --wait
 	@echo "Gateway:    http://127.0.0.1:$(SB_GATEWAY_PORT)/ready"
 	@echo "Grafana:    http://127.0.0.1:$${SB_GRAFANA_PORT:-7300}"
@@ -115,6 +116,26 @@ down: ## Stop the stack (keeps data volumes)
 .PHONY: clean
 clean: ## Stop the stack and delete its data volumes
 	$(COMPOSE) down -v
+
+.PHONY: migrate
+migrate: secrets ## Apply database migrations (`make up` does this too)
+	$(COMPOSE) run --rm setup
+
+.PHONY: team
+team: ## Create a team: make team TEAM=research ARGS="--budget 100 --soft-budget 80"
+	$(COMPOSE) exec gateway switchboard create-team "$(TEAM)" $(ARGS)
+
+.PHONY: key
+key: ## Create an API key: make key TEAM=demo NAME=alice ARGS="--budget 10 --rpm 60"
+	$(COMPOSE) exec gateway switchboard create-key --team "$(TEAM)" --name "$(NAME)" $(ARGS)
+
+.PHONY: revoke
+revoke: ## Revoke an API key everywhere: make revoke PREFIX=sb_live_4f2a
+	$(COMPOSE) exec gateway switchboard revoke-key --prefix "$(PREFIX)"
+
+.PHONY: reload
+reload: ## Reload config/routing.yaml in every gateway replica (SIGHUP; the file watch also does this)
+	$(COMPOSE) kill -s HUP gateway
 
 .PHONY: ps
 ps: ## Show stack status

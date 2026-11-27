@@ -6,6 +6,8 @@ Plain ASGI with a small route table, so the per-chunk path is a sleep and one
 * ``POST /v1/chat/completions`` (OpenAI) and ``POST /v1/messages`` (Anthropic), both
   streaming and not; ``POST /v1/embeddings``, ``GET /v1/models``, ``GET /health``
 * ``GET /_control/stats``, ``POST /_control/reset``, ``PUT|DELETE /_control/behavior``
+* ``POST /_webhook``: a sink that records JSON posts (budget alerts in tests and the
+  local stack), listed in ``/_control/stats`` as ``webhooks``
 
 Stats and runtime behavior live in the worker process. With more than one worker they
 would differ per worker, so the control API refuses to run then.
@@ -56,6 +58,7 @@ class Stats:
     streams_completed: int = 0
     client_disconnects: int = 0
     recent: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=_RECENT_REQUESTS))
+    webhooks: deque[Any] = field(default_factory=lambda: deque(maxlen=_RECENT_REQUESTS))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +67,7 @@ class Stats:
             "streams_completed": self.streams_completed,
             "client_disconnects": self.client_disconnects,
             "recent": list(self.recent),
+            "webhooks": list(self.webhooks),
         }
 
 
@@ -104,6 +108,7 @@ class FakeProvider:
             ("POST", "/_control/reset"): self._control_reset,
             ("PUT", "/_control/behavior"): self._control_set_behavior,
             ("DELETE", "/_control/behavior"): self._control_clear_behavior,
+            ("POST", "/_webhook"): self._webhook,
         }
         error_log = logging.getLogger("uvicorn.error")
         if not any(isinstance(f, _QuietSimulatedDisconnect) for f in error_log.filters):
@@ -149,7 +154,11 @@ class FakeProvider:
             await _json(request.send, 400, dialect.error_body(400, problem, None))
             return
 
-        fault = behavior.fault if self._rng.random() < behavior.fault_rate else Fault.NONE
+        model = str(payload.get("model") or "")
+        targeted = behavior.fault_models is None or model in behavior.fault_models
+        fault = (
+            behavior.fault if targeted and self._rng.random() < behavior.fault_rate else Fault.NONE
+        )
         if fault is not Fault.NONE:
             self.stats.faults[fault.value] += 1
         if fault is Fault.STATUS:
@@ -310,6 +319,13 @@ class FakeProvider:
             return
         self.runtime = {}
         await _json(request.send, 200, orjson.dumps(self.profile.model_dump()))
+
+    async def _webhook(self, request: _Request) -> None:
+        try:
+            self.stats.webhooks.append(orjson.loads(request.body))
+        except orjson.JSONDecodeError:
+            self.stats.webhooks.append({"raw": request.body.decode("latin-1")})
+        await _json(request.send, 200, b'{"ok":true}')
 
     async def _refuse_multi_worker(self, send: Send) -> bool:
         if self._workers == 1:

@@ -13,7 +13,8 @@ official docs on 2026-11-27; source links and the full fact list are in
 | `ollama` | `providers/ollama.py` | ✓ | ✓ | Ollama's OpenAI-compatible `/v1`, with its limits applied. `base_url` is the server root. |
 
 Every upstream call streams; non-streaming clients get an aggregated response
-([ADR-0003](adr/0003-upstream-calls-always-stream.md)). Responses carry
+([ADR-0003](adr/0003-upstream-calls-always-stream.md)). Retries, fallback between
+providers and circuit breakers are described in [ROUTING.md](ROUTING.md). Responses carry
 `x-switchboard-provider`, `x-switchboard-model` and, when request fields were dropped,
 `x-switchboard-dropped-params`.
 
@@ -24,7 +25,11 @@ Every upstream call streams; non-streaming clients get an aggregated response
   reaches the client only if it asked for one.
 - `max_tokens` (deprecated by OpenAI) becomes `max_completion_tokens`. With neither,
   the model's `defaults.max_tokens` applies, if configured.
-- Every other field is forwarded unchanged, including fields Switchboard does not know.
+- Every other field is forwarded unchanged, including fields Switchboard does not know,
+  except `provider_options`: its `openai` entry (`ollama` for Ollama) is merged into the
+  body before the gateway sets `model` and streaming, and the field itself is never
+  forwarded. Entries for other providers are dropped, so a request written for Anthropic
+  can fall back to OpenAI.
 - Usage: OpenAI's `prompt_tokens` includes cached tokens; they are reported separately
   internally and recombined for the client, so clients see OpenAI's numbers.
 
@@ -41,17 +46,17 @@ Every upstream call streams; non-streaming clients get an aggregated response
 | `tool` messages | `tool_result` blocks in one user turn | Consecutive tool messages are merged. |
 | Consecutive same-role turns | Merged | The API would merge them too; merging here keeps the translation deterministic. |
 | `tools[].function` | `tools[]` with `input_schema` | `strict` is passed through. |
-| `tool_choice` `auto` / `none` / `required` / named | `auto` / `none` / `any` / `tool` | Forced choices are refused for models with `forced_tool_choice: false` (Opus 5.5, Sonnet 5.5, Fable 5.2 reject them). |
+| `tool_choice` `auto` / `none` / `required` / named | `auto` / `none` / `any` / `tool` | Models with `forced_tool_choice: false` (Opus 5.5, Sonnet 5.5 and Fable 5.2 reject forced choices) are skipped for such requests, so a fallback that supports it serves them; with none, a 400. |
 | `parallel_tool_calls: false` | `disable_parallel_tool_use: true` | |
 | `max_completion_tokens`, `max_tokens` | `max_tokens` | Required by Anthropic. Fallbacks: the model's `defaults.max_tokens`, then `max_output_tokens`, then 4096. |
 | `reasoning_effort` | `output_config.effort` | `none` and `minimal` → `low`; `low`, `medium`, `high`, `xhigh` map directly. `max` is reachable through `provider_options`. |
-| `response_format` `json_schema` | `output_config.format` | `json_object` has no equivalent and is refused (`json_object: false` in the model's capabilities). |
+| `response_format` `json_schema` | `output_config.format` | `json_object` has no equivalent (`json_object: false` in the model's capabilities), so such requests skip Claude models: a fallback serves them, or the client gets a 400. |
 | `stop` | `stop_sequences` | |
 | `user` | `metadata.user_id` | |
 | `temperature`, `top_p` | Dropped | API version `2026-10-21` rejects them with a 400. A provider pinned to an older `api_version` gets them, with `temperature` clamped to 1. |
-| Anything else (`seed`, `presence_penalty`, `logit_bias`, …) | Dropped | Listed in `x-switchboard-dropped-params`. With `unsupported_params: error` on the provider, refused with a 400 instead. |
+| Anything else (`seed`, `presence_penalty`, `logit_bias`, …) | Dropped | Listed in `x-switchboard-dropped-params`. With `unsupported_params: error` on the provider, not sent: the next candidate is tried, and with none the client gets a 400. |
 | `extra_body.provider_options.anthropic` | Merged into the request last | Escape hatch, e.g. `{"thinking": {"type": "adaptive", "display": "summarized"}}`. |
-| A conversation ending with an assistant message | Refused with a 400 | Current Claude models reject prefill. |
+| A conversation ending with an assistant message | Not sent | Current Claude models reject prefill. The next candidate is tried; with none, a 400. |
 
 ### Response (Anthropic stream → OpenAI chunks)
 
@@ -101,7 +106,8 @@ Per Ollama's OpenAI-compatibility docs (2026-11-27):
   the default anyway; forced choices are refused (configure `forced_tool_choice: false`).
 - `user` and `parallel_tool_calls` are dropped and reported.
 - Images must be base64 data URLs; http(s) image links are refused with a 400.
-- Embeddings accept text only, not token ids. Cost is zero unless priced in Phase 4.
+- Embeddings accept text only, not token ids. Local models are priced at zero
+  (`config/pricing/`).
 
 ## Known gaps
 
@@ -112,6 +118,7 @@ Per Ollama's OpenAI-compatibility docs (2026-11-27):
 - Anthropic reasoning text is not exposed by default (current models default to
   `display: "omitted"`, so there is usually none to expose).
 - Ollama: whether the streamed usage chunk is always present is not stated in its
-  docs; if it is missing, usage is missing for that request (Phase 4 estimates cost).
+  docs; if it is missing, the request's cost is estimated and marked `cost_estimated`
+  ([ACCOUNTING.md](ACCOUNTING.md)).
 - Fixtures under `tests/fixtures/` are built from the documented formats
   (`"source": "docs"`) until `make record-fixtures` records real ones.

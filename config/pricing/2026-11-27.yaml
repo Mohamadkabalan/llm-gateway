@@ -1,0 +1,47 @@
+# Provider prices, USD per million tokens, Standard tier, global (no data-residency)
+# routing. Every row was read from the source page on the date below.
+#
+# This file is immutable once committed: a price change is a new file
+# (config/pricing/<date>.yaml) selected by `pricing:` in config/routing.yaml. Each usage
+# row records the version it was priced with.
+version: "2026-11-27"
+currency: USD
+
+sources:
+  anthropic:
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    retrieved: 2026-11-27
+  openai:
+    url: https://developers.openai.com/api/docs/pricing
+    retrieved: 2026-11-27
+
+models:
+  # --- Anthropic: "Model pricing" table. Cache hits on Opus/Sonnet 5.5 are 0.05x input
+  # and on Fable 5.2 0.025x (footnotes 1 and 2); the figures below are the table's.
+  anthropic/claude-fable-5-2:
+    { input: 8, cache_write_5m: 10, cache_write_1h: 16, cache_read: 0.20, output: 40 }
+  anthropic/claude-opus-5-5:
+    { input: 4, cache_write_5m: 5, cache_write_1h: 8, cache_read: 0.20, output: 20 }
+  anthropic/claude-sonnet-5-5:
+    { input: 2, cache_write_5m: 2.50, cache_write_1h: 4, cache_read: 0.10, output: 10 }
+  anthropic/claude-haiku-5-5:
+    # "A request's prompt length counts all of its input tokens, including cache reads
+    # and cache writes" ("Long context pricing").
+    tiers:
+      - { max_prompt_tokens: 100000, input: 0.10, cache_write_5m: 0.125, cache_write_1h: 0.20,
+          cache_read: 0.01, output: 0.50 }
+      - { input: 0.50, cache_write_5m: 0.625, cache_write_1h: 1, cache_read: 0.05, output: 2.50 }
+
+  # --- OpenAI: Standard pricing (no cache-write column is listed for these models).
+  openai/gpt-5.4-mini: { input: 0.75, cache_read: 0.075, output: 4.50 }
+  openai/text-embedding-3-small: { input: 0.02 }
+
+  # --- Local models cost nothing per token.
+  ollama/llama3.2: { input: 0, output: 0 }
+
+  # --- The fake provider, priced like real models so the local stack shows realistic
+  # costs and budgets. These are copies, not prices of their own.
+  fake/fake-chat: { same_as: anthropic/claude-sonnet-5-5 }
+  fake/fake-embed: { same_as: openai/text-embedding-3-small }
+  fake-anthropic/fake-claude: { same_as: anthropic/claude-sonnet-5-5 }
+  fake-flaky/fake-claude-flaky: { same_as: anthropic/claude-sonnet-5-5 }

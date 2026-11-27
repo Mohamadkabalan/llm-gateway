@@ -137,6 +137,29 @@ def test_body_forwards_client_fields_and_forces_streaming_with_usage() -> None:
     assert body["messages"] == [{"role": "user", "content": "hi"}]
 
 
+def test_provider_options_merge_only_this_providers_entry() -> None:
+    request = ChatRequest.model_validate(
+        {
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"a": 1},
+            "provider_options": {
+                "openai": {"seed": 7, "metadata": {"b": 2}, "stream": False},
+                "anthropic": {"thinking": {"type": "adaptive"}},
+            },
+        }
+    )
+    body = build_body(request, TARGET)
+    assert "provider_options" not in body  # never forwarded: OpenAI rejects unknown fields
+    assert body["seed"] == 7
+    assert body["metadata"] == {"a": 1, "b": 2}  # dicts merge one level deep
+    assert "thinking" not in body  # another provider's options are dropped
+    assert body["stream"] is True  # the gateway's own fields win
+    ollama = build_body(request, TARGET, options_key="ollama")
+    assert "seed" not in ollama
+    assert "provider_options" not in ollama
+
+
 def test_body_prefers_max_completion_tokens_and_falls_back_to_model_default() -> None:
     base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     both = ChatRequest.model_validate({**base, "max_tokens": 5, "max_completion_tokens": 7})

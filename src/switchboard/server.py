@@ -33,7 +33,7 @@ class GatewayServer(uvicorn.Server):
 def serve(settings: Settings, routing: LoadedConfig) -> None:
     lifecycle = Lifecycle()
     config = uvicorn.Config(
-        create_app(settings, routing, lifecycle=lifecycle),
+        create_app(settings, routing, lifecycle=lifecycle, config_path=settings.routing_config),
         host=settings.host,
         port=settings.port,
         loop="uvloop",

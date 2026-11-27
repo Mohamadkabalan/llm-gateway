@@ -1,7 +1,9 @@
-"""``POST /v1/chat/completions``: authenticate, validate, route, then hand off.
+"""``POST /v1/chat/completions``: authenticate, validate, route, admit, then hand off.
 
-Everything that can fail cheaply (auth, size, validation, routing) fails here with a
-normal error response. The upstream call itself runs in ``ChatResponder``.
+Everything that can fail cheaply (auth, size, validation, routing, rate limits,
+budgets) fails here with a normal error response, and every refusal after
+authentication is still recorded in the ledger. The upstream work (retries,
+fallbacks, streaming) runs in ``ChatResponder``.
 """
 
 from fastapi import APIRouter, Request
@@ -9,44 +11,69 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from starlette.responses import Response
 
+from switchboard.accounting.ledger import output_estimate
+from switchboard.api.admission import check_model_access, open_ledger, recorded
 from switchboard.api.auth import authenticate
 from switchboard.api.body import read_json
 from switchboard.api.errors import GatewayError
 from switchboard.api.responder import ChatResponder
-from switchboard.providers.base import CallContext
-from switchboard.routing.capabilities import missing_capabilities
+from switchboard.api.tags import request_tags
 from switchboard.routing.config import ModelKind
+from switchboard.routing.table import RouteRequest
 from switchboard.schemas.chat import ChatRequest
 from switchboard.state import get_state
 
 router = APIRouter()
 
+RESERVATION_MARGIN_S = 60.0  # how long past the request deadline a reservation lives
+
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Response:
     state = get_state(request)
-    authenticate(request, state.settings.dev_api_key)
-    chat = parse_chat_request(await read_json(request, state.settings.max_request_bytes))
-
-    plan = state.routing_table.resolve(chat.model, ModelKind.CHAT)
-    target = plan.targets[0]
-    if missing := missing_capabilities(chat, target.capabilities):
-        raise GatewayError(
-            400,
-            f"The model '{chat.model}' does not support {'; '.join(missing)}.",
-            code="model_capability_missing",
+    key = await authenticate(request, state.keys)
+    snapshot = state.config.current  # this request keeps it, even across a reload
+    ledger = open_ledger(state, request, key, endpoint="chat")
+    with recorded(ledger):
+        payload = await read_json(request, state.settings.max_request_bytes)
+        if isinstance(payload, dict) and isinstance(payload.get("model"), str):
+            ledger.describe(requested_model=payload["model"])
+        tags = request_tags(request)
+        chat = parse_chat_request(payload)
+        ledger.describe(
+            requested_model=chat.model, stream=chat.stream, end_user=chat.user, tags=tags
         )
-    adapter = state.adapters[target.provider]  # routing only returns enabled providers
+        check_model_access(key, chat.model)
+        route_request = RouteRequest(
+            model=chat.model,
+            kind=ModelKind.CHAT,
+            chat=chat,
+            key=key.key_name,
+            team=key.team_name,
+            tags=key.tags | tags,
+            sticky_subject=str(key.key_id),
+        )
+        plan = snapshot.table.plan(route_request)
+        primary = plan.primary
+        await ledger.admit(
+            plan,
+            route_request.prompt_tokens,
+            output_estimate(chat.output_limit, primary),
+            hold_s=primary.timeouts.total + RESERVATION_MARGIN_S,
+        )
 
     scope_state = request.scope["state"]
     return ChatResponder(
         chat=chat,
         plan=plan,
-        adapter=adapter,
-        ctx=CallContext(request_id=scope_state["request_id"], timeouts=target.timeouts),
+        executor=state.executor,
+        adapters=snapshot.adapters,
+        request_id=scope_state["request_id"],
+        scope=str(key.team_id),  # thinking-sidecar entries never cross teams
         lifecycle=state.lifecycle,
         received_at=scope_state["received_at"],
         log_fields=scope_state["log"],
+        ledger=ledger,
     )
 
 

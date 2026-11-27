@@ -23,7 +23,7 @@ async def health() -> ORJSONResponse:
 
 @router.get("/ready")
 async def ready(state: Annotated[AppState, Depends(get_state)]) -> ORJSONResponse:
-    body: dict[str, object] = {"config_version": state.routing.version}
+    body: dict[str, object] = {"config_version": state.config.current.version}
     if state.lifecycle.draining:
         return ORJSONResponse({"status": "draining", **body}, status_code=503)
 

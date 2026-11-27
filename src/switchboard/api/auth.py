@@ -1,25 +1,19 @@
-"""API key check for the data plane.
+"""Data-plane authentication: ``Authorization: Bearer sb_live_…`` → ``KeyContext``.
 
-Phase 1 accepts one static key from ``SWITCHBOARD_DEV_API_KEY``. Phase 4 replaces this
-with hashed virtual keys looked up per request; handlers already call it through
-``authenticate`` so only this module changes.
+Keys are virtual keys from the ``api_keys`` table, looked up by their HMAC through the
+cached ``KeyResolver`` (``switchboard.auth.resolver``).
 """
 
-import hmac
-
-from pydantic import SecretStr
 from starlette.requests import Request
 
 from switchboard.api.errors import GatewayError
+from switchboard.auth.context import KeyContext
+from switchboard.auth.resolver import AuthError, KeyResolver
 
 _UNAUTHORIZED = {"www-authenticate": "Bearer"}
 
 
-def authenticate(request: Request, dev_api_key: SecretStr | None) -> None:
-    if dev_api_key is None:
-        raise GatewayError(
-            401, "No API keys are configured on this gateway.", code="invalid_api_key"
-        )
+async def authenticate(request: Request, keys: KeyResolver) -> KeyContext:
     header = request.headers.get("authorization")
     if not header:
         raise GatewayError(
@@ -29,8 +23,12 @@ def authenticate(request: Request, dev_api_key: SecretStr | None) -> None:
             headers=_UNAUTHORIZED,
         )
     scheme, _, token = header.partition(" ")
-    expected = dev_api_key.get_secret_value().encode()
-    if scheme.lower() != "bearer" or not hmac.compare_digest(token.strip().encode(), expected):
+    if scheme.lower() != "bearer":
         raise GatewayError(
             401, "Incorrect API key provided.", code="invalid_api_key", headers=_UNAUTHORIZED
         )
+    try:
+        return await keys.resolve(token.strip())
+    except AuthError as exc:
+        headers = _UNAUTHORIZED if exc.status == 401 else None
+        raise GatewayError(exc.status, exc.message, code=exc.code, headers=headers) from None

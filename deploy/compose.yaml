@@ -19,7 +19,10 @@ services:
       SWITCHBOARD_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       SWITCHBOARD_LOG_LEVEL: ${SWITCHBOARD_LOG_LEVEL:-info}
       SWITCHBOARD_LOG_FORMAT: ${SWITCHBOARD_LOG_FORMAT:-json}
-      SWITCHBOARD_DEV_API_KEY: ${SWITCHBOARD_DEV_API_KEY:-}
+      SWITCHBOARD_KEY_PEPPER: ${SWITCHBOARD_KEY_PEPPER:?run `make secrets` to create .env}
+      # Budget alerts go to the fake provider's webhook sink locally; set your own
+      # (Slack-compatible) URL in .env to receive them.
+      SWITCHBOARD_ALERT_WEBHOOK_URL: ${SWITCHBOARD_ALERT_WEBHOOK_URL:-http://fake-provider:8000/_webhook}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ports:
@@ -27,13 +30,37 @@ services:
     volumes:
       - ../config:/app/config:ro
     depends_on:
+      setup: { condition: service_completed_successfully }
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       fake-provider: { condition: service_healthy }
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
-    stop_grace_period: 30s   # > SWITCHBOARD_SHUTDOWN_GRACE_SECONDS (25s) so streams can drain
+    stop_grace_period: 30s
+
+  # One-shot, before the gateway: apply migrations, then make sure the demo key whose
+  # secret is in .env (SWITCHBOARD_DEMO_KEY) exists, in team "demo" with a $5 monthly
+  # budget and an alert at $4, so local experiments with real providers stay cheap.
+  setup:
+    image: switchboard/gateway:dev
+    pull_policy: never   # built by the gateway service
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        switchboard migrate
+        switchboard ensure-key --team demo --name local --secret-env SWITCHBOARD_DEMO_KEY \
+          --team-budget 5 --team-soft-budget 4
+    environment:
+      SWITCHBOARD_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SWITCHBOARD_KEY_PEPPER: ${SWITCHBOARD_KEY_PEPPER:?run `make secrets` to create .env}
+      SWITCHBOARD_DEMO_KEY: ${SWITCHBOARD_DEMO_KEY:?run `make secrets` to create .env}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    cap_drop: [ALL]   # > SWITCHBOARD_SHUTDOWN_GRACE_SECONDS (25s) so streams can drain
 
   # The fake provider ships in the gateway image. The `fake` alias routes to it, so the
   # stack answers real OpenAI SDK calls with no provider keys.
@@ -43,6 +70,10 @@ services:
     pull_policy: never   # built by the gateway service
     entrypoint: ["fakeprovider"]
     command: ["--port", "8000", "--profile", "/app/config/fake/default.yaml"]
+    ports:
+      # Published (loopback only) for its control API: tests and chaos runs break and
+      # heal it from the host (see docs/ROUTING.md, "Try failover locally").
+      - "127.0.0.1:${SB_FAKE_PORT:-7800}:8000"
     volumes:
       - ../config:/app/config:ro
     read_only: true

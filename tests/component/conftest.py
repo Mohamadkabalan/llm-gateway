@@ -10,20 +10,25 @@ import contextlib
 import socket
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
 import openai
 import pytest
 import uvicorn
+from redis.asyncio import Redis
 from starlette.types import ASGIApp
 
 from fakeprovider.app import FakeProvider
-from switchboard.app import create_app
-from switchboard.routing import parse_routing_config
+from switchboard.accounting.usage import MemoryUsageSink
+from switchboard.app import Overrides, create_app
+from switchboard.auth.store import MemoryKeyStore
+from switchboard.routing import load_routing_config, parse_routing_config
 from tests.conftest import SettingsFactory
+from tests.support import REPO_ROOT, TEST_KEY, TEST_PEPPER, key_store
 
-API_KEY = "sb-test-key"
+API_KEY = TEST_KEY
 
 
 @contextlib.asynccontextmanager
@@ -50,10 +55,17 @@ async def serve(app: ASGIApp) -> AsyncIterator[str]:
 
 
 def routing_yaml(
-    fake_url: str, *, defaults: str = "", providers: str = "", models: str = "", aliases: str = ""
+    fake_url: str,
+    *,
+    defaults: str = "",
+    providers: str = "",
+    models: str = "",
+    aliases: str = "",
+    rules: str = "",
 ) -> str:
     """The base test config plus extra YAML lines; ``{fake_url}`` in them is filled in."""
     providers = providers.replace("{fake_url}", fake_url)
+    rules = f"rules:\n{rules}" if rules else ""
     return f"""\
 version: 1
 {defaults}
@@ -77,6 +89,7 @@ aliases:
   embed:
     targets: [{{ model: fake/fake-embed }}]
 {aliases}
+{rules}
 """
 
 
@@ -85,6 +98,8 @@ class Stack:
     gateway_url: str
     fake: FakeProvider
     fake_url: str
+    usage: MemoryUsageSink
+    keys: MemoryKeyStore
     _sdk_clients: list[openai.AsyncOpenAI] = field(default_factory=list)
 
     def http(self, **kwargs: Any) -> httpx.AsyncClient:
@@ -120,21 +135,51 @@ def make_stack(make_settings: SettingsFactory, monkeypatch: pytest.MonkeyPatch) 
         providers: str = "",
         models: str = "",
         aliases: str = "",
+        rules: str = "",
+        config_file: Path | None = None,
+        keys: MemoryKeyStore | None = None,
+        redis: Redis | None = None,
+        priced: bool = False,
+        alert_webhook: bool = False,
         **settings: Any,
     ) -> AsyncIterator[Stack]:
+        """With ``config_file``, the config is written there and the gateway watches it.
+        ``keys`` replaces the one test key; ``redis`` (e.g. fakeredis) turns on rate
+        limits and budgets; ``priced`` uses the shipped pricing file; ``alert_webhook``
+        sends budget alerts to the fake provider's webhook sink."""
         fake = FakeProvider(seed=1)
         async with serve(fake) as fake_url:
-            routing = parse_routing_config(
-                routing_yaml(
-                    fake_url, defaults=defaults, providers=providers, models=models, aliases=aliases
-                ),
-                source="test.yaml",
-                env={"FAKE_UPSTREAM_KEY": "sk-upstream-test"},
+            text = routing_yaml(
+                fake_url,
+                defaults=defaults,
+                providers=providers,
+                models=models,
+                aliases=aliases,
+                rules=rules,
             )
-            settings.setdefault("dev_api_key", API_KEY)
-            app = create_app(make_settings(**settings), routing)
+            env = {"FAKE_UPSTREAM_KEY": "sk-upstream-test"}
+            if priced:
+                text = text.replace(
+                    "version: 1\n", "version: 1\npricing: pricing/2026-11-27.yaml\n", 1
+                )
+            if config_file is None:
+                routing = parse_routing_config(
+                    text, source="test.yaml", env=env, base_dir=REPO_ROOT / "config"
+                )
+            else:
+                config_file.write_text(text)
+                routing = load_routing_config(config_file, env=env)
+            settings.setdefault("key_pepper", TEST_PEPPER)
+            if alert_webhook:
+                settings["alert_webhook_url"] = f"{fake_url}/_webhook"
+            store = keys if keys is not None else key_store()
+            usage = MemoryUsageSink()
+            overrides = Overrides(key_store=store, usage_sink=usage, redis=redis)
+            app = create_app(
+                make_settings(**settings), routing, config_path=config_file, overrides=overrides
+            )
             async with serve(app) as gateway_url:
-                running = Stack(gateway_url, fake, fake_url)
+                running = Stack(gateway_url, fake, fake_url, usage, store)
                 try:
                     yield running
                 finally:

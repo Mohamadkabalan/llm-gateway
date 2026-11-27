@@ -17,19 +17,22 @@ class CallTimings:
 
     upstream_start: float | None = None  # just before the upstream request is sent
     first_content_read: float | None = None  # when the first content event's bytes arrived
+    last_read: float = 0.0  # the latest network read, for the idle timeout
 
 
 @dataclass(frozen=True, slots=True)
 class CallContext:
+    """One upstream attempt. A request with retries or fallbacks has several."""
+
     request_id: str
     timeouts: Timeouts
-    attempt: int = 1
+    attempt: int = 1  # 1-based, counted across the request's attempts
     timings: CallTimings = field(default_factory=CallTimings)
     # Request fields the adapter could not send and dropped (unsupported_params: drop).
     # Reported to the client in x-switchboard-dropped-params.
     dropped_params: list[str] = field(default_factory=list)
     # Who the request belongs to, for state kept between requests (the thinking
-    # sidecar). The team id from Phase 4; a single shared scope until then.
+    # sidecar): the team id, so teams never see each other's stored state.
     scope: str = "default"
 
 

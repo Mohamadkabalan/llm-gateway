@@ -15,8 +15,9 @@ import pytest
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from prometheus_client import REGISTRY
 
+from switchboard.auth.store import MemoryKeyStore
 from switchboard.observability.logging import configure_logging
-from tests.component.conftest import Stack, StackFactory
+from tests.component.conftest import API_KEY, Stack, StackFactory
 
 USER: list[ChatCompletionMessageParam] = [{"role": "user", "content": "hello"}]
 FAST = {"ttft_ms": 0, "interval_ms": 0, "chunks": 4}
@@ -168,7 +169,8 @@ async def test_concrete_model_name_routes_directly(stack: Stack) -> None:
         ({"status": 503}, 502, "upstream_error"),
         ({"status": 500}, 502, "upstream_error"),
         ({"status": 401}, 502, "upstream_auth_failed"),
-        ({"status": 429, "retry_after": 7}, 429, "upstream_rate_limited"),
+        # Longer than honor_retry_after_up_to (10s), so it is returned rather than retried.
+        ({"status": 429, "retry_after": 30}, 429, "upstream_rate_limited"),
         ({"status": 429, "error_code": "insufficient_quota"}, 503, "upstream_quota_exhausted"),
         ({"status": 400}, 400, "upstream_bad_request"),
     ],
@@ -191,7 +193,7 @@ async def test_upstream_http_errors_map_to_client_errors(
     assert response.json()["error"]["code"] == code
     assert response.headers["x-switchboard-provider"] == "fake"
     if "retry_after" in upstream:
-        assert response.headers["retry-after"] == "7"
+        assert response.headers["retry-after"] == "30"
 
 
 async def test_upstream_auth_failure_message_does_not_leak_provider_details(stack: Stack) -> None:
@@ -342,7 +344,7 @@ def _requests(**labels: str) -> float:
     [
         ({}, "missing_api_key"),
         ({"authorization": "Bearer wrong"}, "invalid_api_key"),
-        ({"authorization": "Basic sb-test-key"}, "invalid_api_key"),
+        ({"authorization": f"Basic {API_KEY}"}, "invalid_api_key"),
     ],
 )
 async def test_api_key_is_required(stack: Stack, headers: dict[str, str], code: str) -> None:
@@ -356,8 +358,8 @@ async def test_api_key_is_required(stack: Stack, headers: dict[str, str], code: 
     assert stack.fake.stats.requests["/v1/chat/completions"] == 0
 
 
-async def test_without_a_configured_key_every_request_is_rejected(make_stack: StackFactory) -> None:
-    async with make_stack(dev_api_key=None) as stack, stack.http() as http:
+async def test_without_any_keys_every_request_is_rejected(make_stack: StackFactory) -> None:
+    async with make_stack(keys=MemoryKeyStore()) as stack, stack.http() as http:
         response = await http.post("/v1/chat/completions", json={"model": "fake", "messages": USER})
     assert response.status_code == 401
 

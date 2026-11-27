@@ -19,7 +19,9 @@ services:
     image: switchboard/gateway:dev
     environment:
       SWITCHBOARD_ROUTING_CONFIG: /app/config/routing.bench.yaml
-      SWITCHBOARD_DEV_API_KEY: sb-bench-local-only
+      SWITCHBOARD_DATABASE_URL: postgresql://bench:bench-local-only@postgres:5432/bench
+      SWITCHBOARD_REDIS_URL: redis://redis:6379/0
+      SWITCHBOARD_KEY_PEPPER: bench-local-only-pepper-not-a-secret-000000
       SWITCHBOARD_LOG_LEVEL: info
       SWITCHBOARD_LOG_FORMAT: json
     volumes:
@@ -31,7 +33,52 @@ services:
     ulimits:
       nofile: { soft: 65536, hard: 65536 }
     depends_on:
+      setup: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
       fake-provider: { condition: service_healthy }
+
+  # Production defaults (PLAN.md §16.1): a virtual key with limits far above the load,
+  # and a budget, so admission, settlement and the usage ledger all run on every request.
+  setup:
+    image: switchboard/gateway:dev
+    pull_policy: never
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        switchboard migrate
+        switchboard ensure-key --team bench --name k6 --secret-env SWITCHBOARD_BENCH_KEY \
+          --rpm 10000000 --tpm 2000000000 --team-budget 1000000
+    environment:
+      SWITCHBOARD_DATABASE_URL: postgresql://bench:bench-local-only@postgres:5432/bench
+      SWITCHBOARD_REDIS_URL: redis://redis:6379/0
+      SWITCHBOARD_KEY_PEPPER: bench-local-only-pepper-not-a-secret-000000
+      SWITCHBOARD_BENCH_KEY: sb_live_bench0000000000000000000000000000000000000
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18-trixie
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench-local-only
+      POSTGRES_DB: bench
+    tmpfs: [/var/lib/postgresql]   # throwaway data; nothing to clean up between runs
+    cpuset: "${SB_BENCH_CPUS_DATA:-6,7}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench -d bench"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:8.10.3-alpine
+    cpuset: "${SB_BENCH_CPUS_DATA:-6,7}"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   fake-provider:
     image: switchboard/gateway:dev
@@ -60,6 +107,6 @@ services:
     profiles: [tools]   # started per run by bench/run.py, never by `up`
     volumes:
       - ../bench/k6:/scripts:ro
-    cpuset: "${SB_BENCH_CPUS_K6:-4-7}"
+    cpuset: "${SB_BENCH_CPUS_K6:-4,5}"
     ulimits:
       nofile: { soft: 65536, hard: 65536 }

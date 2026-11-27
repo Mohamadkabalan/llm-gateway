@@ -1,4 +1,5 @@
-# Switchboard routing config. Full reference: docs/ROUTING.md (written in Phase 3).
+# Switchboard routing config. Full reference: docs/ROUTING.md. Edits are picked up
+# within a second (or run `make reload`); an invalid edit is logged and ignored.
 #
 # Secrets never live here: providers name the environment variable holding their key.
 # Providers marked `optional: true` are disabled (with a warning) when that variable is
@@ -6,9 +7,10 @@
 #
 # Model IDs and capabilities were checked against provider docs on 2026-11-27
 # (PLAN.md §3.8; Anthropic re-checked for Phase 2, see docs/PROVIDERS.md). Prices live
-# in config/pricing/ (Phase 4).
+# in config/pricing/, re-checked on 2026-11-27.
 
 version: 1
+pricing: pricing/2026-11-27.yaml   # USD per million tokens; every model needs a row
 
 defaults:
   timeouts: { connect: 2s, first_token: 30s, idle: 30s, total: 600s }
@@ -42,6 +44,14 @@ providers:
     type: anthropic
     base_url: http://fake-provider:8000
     api_version: "2026-10-21"
+  fake-flaky:
+    # The fake again, with no retries and a breaker that trips fast, for trying failover
+    # locally and for the integration tests (docs/ROUTING.md, "Try failover locally").
+    type: anthropic
+    base_url: http://fake-provider:8000
+    api_version: "2026-10-21"
+    retry: { max_attempts: 1 }
+    breaker: { min_requests: 5, window: 10s, cooldown: 3s, half_open_probes: 2 }
 
 models:
   anthropic/claude-opus-5-5:
@@ -80,6 +90,11 @@ models:
     capabilities: { tools: true, vision: true, forced_tool_choice: true, json_schema: true,
                     json_object: false, max_output_tokens: 128000 }
     defaults: { max_tokens: 1024 }
+  fake-flaky/fake-claude-flaky:
+    upstream_model: fake-claude-flaky
+    capabilities: { tools: true, vision: true, forced_tool_choice: true, json_schema: true,
+                    json_object: false, max_output_tokens: 128000 }
+    defaults: { max_tokens: 1024 }
 
 aliases:
   smart:
@@ -98,7 +113,17 @@ aliases:
   fake-claude:
     description: Fake provider through the Anthropic translation; no keys needed.
     targets: [{ model: fake-anthropic/fake-claude }]
+  fake-fallback:
+    description: A fake Claude model that fails over to the fake OpenAI model.
+    targets: [{ model: fake-flaky/fake-claude-flaky }]
+    fallbacks: [fake/fake-chat]
   fake-embed:
     targets: [{ model: fake/fake-embed }]
   embed-default:
     targets: [{ model: openai/text-embedding-3-small }]
+
+rules:
+  # First match wins. Requests can carry tags in `X-Switchboard-Tags: a, b`.
+  - name: tagged-via-claude
+    when: { model: fake, tags_any: [via-claude] }
+    use: { alias: fake-claude }
