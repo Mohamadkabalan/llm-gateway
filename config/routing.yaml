@@ -1,0 +1,84 @@
+# Switchboard routing config. Full reference: docs/ROUTING.md (written in Phase 3).
+#
+# Secrets never live here: providers name the environment variable holding their key.
+# Providers marked `optional: true` are disabled (with a warning) when that variable is
+# unset, so `make up` works without any provider keys.
+#
+# Model IDs and capabilities were checked against provider docs on 2026-11-27
+# (PLAN.md §3.8). Prices live in config/pricing/ (Phase 4).
+
+version: 1
+
+defaults:
+  timeouts: { connect: 2s, first_token: 30s, idle: 30s, total: 600s }
+  retry: { max_attempts: 2, base_delay: 250ms, max_delay: 4s, honor_retry_after_up_to: 10s, budget_ratio: 0.2 }
+  breaker: { window: 30s, min_requests: 20, failure_rate: 0.5, cooldown: 30s, max_cooldown: 5m, half_open_probes: 3 }
+  keepalive_after: 5s
+
+providers:
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    api_version: "2026-10-21"     # rejects temperature/top_p/top_k; see PLAN.md §3.3
+    unsupported_params: drop
+    optional: true
+  openai:
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    optional: true
+  ollama:
+    type: ollama
+    base_url: http://ollama:11434
+    timeouts: { first_token: 120s }   # CPU inference is slow to start
+  fake:
+    # Configurable fake provider (Phase 1) used by tests, benchmarks and chaos runs.
+    type: openai
+    base_url: http://fake-provider:8000/v1
+
+models:
+  anthropic/claude-opus-5-5:
+    upstream_model: claude-opus-5-5
+    capabilities: { tools: true, vision: true, forced_tool_choice: false, json_schema: true,
+                    max_input_tokens: 1000000, max_output_tokens: 128000 }
+    defaults: { max_tokens: 8192 }
+  anthropic/claude-sonnet-5-5:
+    upstream_model: claude-sonnet-5-5
+    capabilities: { tools: true, vision: true, forced_tool_choice: false, json_schema: true,
+                    max_input_tokens: 1000000, max_output_tokens: 128000 }
+    defaults: { max_tokens: 8192 }
+  anthropic/claude-haiku-5-5:
+    upstream_model: claude-haiku-5-5
+    capabilities: { tools: true, vision: true, forced_tool_choice: true, json_schema: true,
+                    max_input_tokens: 1000000, max_output_tokens: 128000 }
+    defaults: { max_tokens: 4096 }
+  openai/gpt-5.4-mini:
+    upstream_model: gpt-5.4-mini
+    capabilities: { tools: true, vision: true, json_schema: true }
+  openai/text-embedding-3-small:
+    upstream_model: text-embedding-3-small
+    kind: embedding
+  ollama/llama3.2:
+    upstream_model: "llama3.2:3b"
+    capabilities: { tools: true, forced_tool_choice: false }
+  fake/fake-chat:
+    upstream_model: fake-chat
+    capabilities: { tools: true, vision: true, json_schema: true }
+
+aliases:
+  smart:
+    description: Default for complex tasks.
+    targets: [{ model: anthropic/claude-sonnet-5-5 }]
+    fallbacks: [openai/gpt-5.4-mini, anthropic/claude-haiku-5-5]
+  fast:
+    description: Low latency, low cost.
+    targets: [{ model: anthropic/claude-haiku-5-5 }]
+    fallbacks: [openai/gpt-5.4-mini]
+  local:
+    targets: [{ model: ollama/llama3.2 }]
+  fake:
+    description: Fake provider; works with no API keys.
+    targets: [{ model: fake/fake-chat }]
+  embed-default:
+    targets: [{ model: openai/text-embedding-3-small }]

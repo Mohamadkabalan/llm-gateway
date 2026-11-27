@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local secrets and overrides (never commit)
+.env
+.env.*
+!.env.example
+deploy/compose.override.yaml
+
+# Node (web/admin, Phase 6)
+node_modules/
+.next/
+.pnpm-store/
+
+# Benchmarks: raw results are committed per published run; scratch runs are not
+bench/results/scratch-*/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
